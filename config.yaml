@@ -1,0 +1,254 @@
+# Agent 3 Synthesis Pipeline Configuration
+# This configuration file contains all settings for the synthesis pipeline
+# that transforms normalized credit portfolio data into PowerPoint presentations
+
+runtime:
+  # GCP settings for Vertex AI / Gemini Flash
+  project_id: "426360366917"
+  location: "us-central1"
+  generative_model_name: "gemini-2.5-flash"
+  temperature: 0.6
+  
+  # Runtime settings
+  log_level: "info"
+  parallel_workers: 4
+  cache_enabled: true
+  random_seed: 42  # For deterministic tie-breakers
+  max_retries: 3
+  timeout_seconds: 300
+
+render:
+  # Figure settings
+  figure_dpi: 220  # CRITICAL: Must be exactly 220
+  figure_width_inches: 13
+  figure_height_inches: 7.5
+  export_pdf: false
+  
+  # Rendering policies
+  zero_cut_policy: "auto"  # avoid, allow, auto
+  overlay_legibility_threshold: 0.35
+  spaghetti_fade_others: true
+  spaghetti_fade_alpha: 0.45  # 40-60% range, default 45%
+  
+  # Number formatting
+  label_sig_figs: 2
+  currency_scale: "auto"  # auto, K, M, B
+  percent_decimals: 1
+  add_thousands_separators: true
+  
+  # Visual specifications
+  gridline_color: "#D1D5DB"
+  axis_color: "#424242"
+  tick_steps_target: 6  # Target 5-7 ticks
+  tick_steps_min: 5
+  tick_steps_max: 7
+  
+  # Chart specific settings
+  a3_chart_kind: "stacked_area_100"  # stacked_area_100, stacked_bar_100
+  a3_labels_always_on: true  # CRITICAL: Labels must always be ON for A3
+  max_annotations_per_chart: 2
+  max_spaghetti_series: 6  # CRITICAL: Must be 6, not 5
+  legend_bottom: true
+  legend_bottom_pad: 0.22
+  legend_position: TOP
+  legend_font_pt: 11
+  category_font_pt: 9
+  value_font_pt: 9
+  single_chart_left_in: 0.10
+  single_chart_right_in: 0.10
+  single_chart_top_in: 1.2
+  single_chart_bottom_in: 0.5
+  single_chart_min_height_in: 4.8
+  single_chart_bottom_margin_in: 0.5
+  subtitle_gap_in: 0.1
+  subtitle_height_in: 0.45
+  chart_gap_in: 0.05
+  two_chart_gap_in: 0.25
+  single_chart_height_in: 5.9
+  single_chart_fill_height: true
+  single_chart_width_in: null
+
+logic:
+  # Data requirements
+  min_periods_for_trend: 3
+  min_periods_for_snapshot: 1
+  sparsity_threshold: 0.5  # Drop series if ≥50% missing
+  min_data_points: 3  # Drop series if <3 points
+  
+  # Visualization thresholds
+  legibility_threshold: 0.15
+  max_callouts: 2
+  max_annotations: 2  # Enforce annotation budget
+  
+  # Family resolution
+  prefer_granularity_from_engagement: true
+  enforce_single_granularity_family: true
+  delta_short_family: "auto"  # auto, qoq, mom
+  granularity_family: "both"  # auto, quarterly, monthly, both
+  use_yoy_default: true
+  
+  # Processing flags
+  allow_indexing: true
+  allow_utilization: true
+  allow_shares: true  # Display-only share calculations
+  tie_strapline_to_objectives: true
+  guard_product_restrictions: true
+  missing_as_na: true
+  title_style: "insight-first"
+  aggregate_tail_as_others: false
+  label_policy: "smart"  # smart, all, none
+  
+  # Per-consumer materiality thresholds (as separate fields)
+  per_consumer_correlation_threshold: 0.92  # Max correlation
+  per_consumer_difference_threshold: 0.15   # Min mean absolute % difference
+  include_per_consumer_counterparts: "auto"  # auto, always, never
+  default_focus_quarter: "Q4"
+
+brand:
+  client_name: "Client"
+  use_brand_template: true  # Honor this flag explicitly
+  preferred_template: "company_brand.pptx"  # must exist in ./templates
+  fallback_template: "default_brand.pptx"
+  primary_color: "#003B70"
+  secondary_color: "#00BDF2"
+  font_family: "Arial"
+  logo_path: "assets/logo.png"
+  objectives: []  # Will be populated from engagement.json
+
+features:
+  # Feature flags
+  composition_base: "auto"  # auto, with_balance, all
+  auto_light_up_new_fields: true
+  payments_on_bankcard_privatelabel: false
+  auto_add_overview_topics: false
+  long_horizon_indexed_slide: false
+  single_content_only: true  # CRITICAL: Must be true
+  force_single_content: true
+  narrative_engine: "vertex"  # Options: "vertex" or "deterministic"
+  enable_pdf_export: false
+  enable_cross_topic_rollup: false
+  agenda_sections_only: true
+  chart_engine: pptx
+  combo_strategy: two_charts
+  add_dpd_change_table: true
+  chart_title_inside: true
+  only_periodic_line_trends: true
+  show_subtitle: false
+  descriptive_titles_only: false
+
+# Style colors - Distinct tier palette (no grays)
+style_colors:
+  SUBPRIME: "#E53935"  # CRITICAL: Must be exactly this value
+  NEAR_PRIME: "#F59E0B"  # Orange
+  PRIME: "#FBBF24"  # Yellow
+  PRIME_PLUS: "#34D399"  # Green
+  SUPER_PRIME: "#60A5FA"  # Blue
+  UNSCORED: "#CBD5E1"  # Light slate
+  OTHER: "#94A3B8"  # Blue-gray
+  TOTAL: "#475569"  # Dark slate
+  CURRENT_PERIOD: "#FFC000"
+  PRIOR_PERIOD: "#00B0F0"
+  DPD_30: "#00B0F0"
+  DPD_60: "#FFC000"
+  DPD_90: "#FF0000"
+  gridlines: "#D1D5DB"
+
+# Tier order for legends and sorting
+tier_order:
+  - SUPER_PRIME
+  - PRIME_PLUS
+  - PRIME
+  - NEAR_PRIME
+  - SUBPRIME
+  - UNSCORED
+  - OTHER
+  - TOTAL
+
+# Delta clusters - EXACT specification (2-3 metrics max per cluster)
+delta_clusters:
+  Balances:
+    - tot_acct_bal
+    - tot_acct_vol
+  Originations:
+    - tot_new_acct_bal
+    - tot_new_acct
+  "Supply totals":
+    - tot_cr_lines
+    - tot_open_to_buy
+  "Supply averages":
+    - avg_cr_lines
+    - avg_open_to_buy
+    - avg_open_to_buy_per_cnsmr
+  "Average set":
+    - avg_acct_bal
+    - avg_tot_bal_per_cnsmr
+    - avg_acct_per_cnsmr
+
+# Column aliases for normalization
+column_aliases:
+  account_balance: tot_acct_bal
+  account_volume: tot_acct_vol
+  new_accounts_balance: tot_new_acct_bal
+  new_accounts: tot_new_acct
+  credit_lines: tot_cr_lines
+  open_to_buy: tot_open_to_buy
+  accounts_per_consumer: avg_acct_per_cnsmr
+  balance_per_consumer: avg_tot_bal_per_cnsmr
+
+# Topic to LOB mapping for product restrictions
+topic_to_lob:
+  bankcard: REVOLVING
+  private_label: REVOLVING
+  auto: NON_REVOLVING
+  mortgage: NON_REVOLVING
+  home_equity: REVOLVING
+  student_loan: NON_REVOLVING
+  personal_loan: NON_REVOLVING
+  collections: MIXED
+  overview: MIXED
+
+# Narrative limits for LLM generation
+narrative_limits:
+  title_max_chars: 85
+  bullet_min: 2
+  bullet_max: 3
+  strapline_max_chars: 140
+  speaker_notes_bullets: 3
+
+# Footer text specifications (EXACT strings)
+footers:
+  default: "Source: Client CSV manifest (Agent 2 output). Totals may not equal 100 due to rounding."
+  utilization: "Utilization = 1 − OTB/CL; not shown where CL = 0 or inputs missing."
+  sparse: "Some series suppressed due to limited data availability."
+  missing_base: "YoY/QoQ not shown where a valid base period is unavailable."
+  snapshot: "Some tiers suppressed due to missing values in the latest period."
+
+# Agenda slide caveats (EXACT strings)
+agenda_caveats:
+  - "PoC: local files only"
+  - "No recompute of deltas"
+  - "Single granularity & delta family (lean)"
+  - "Single-content slides"
+  - "No macroeconomic module (PoC scope)"
+
+# Validation settings
+validation:
+  allow_heatmaps: false  # CRITICAL: Must be false
+  enforce_single_content: false
+  require_composition_base_logging: true
+  require_cache_reuse: true
+  require_continuous_time_axis: true
+  require_dotted_gaps: true
+  max_annotations: 2
+  require_a3_labels: true
+viz_defaults:
+  periodic_trend:
+    apply_to: ["delinquency", "trend"]
+  term_buckets:
+    default: ["1-23","24-35","36-47","48-59","60-71","72-83","84+"]
+    Auto: ["1-23","24-35","36-47","48-59","60-71","72-83","84+"]
+    PL: ["1-11","12-23","24-35","36-47","48-59","60-71","72+"]
+  score_bins: ["<500","500-579","580-619","620-659","660-679","680-699","700-719","720-739","740-759","760+"]
+  granular_palette_lobs: ["Mortgage","HELOC"]
+  term_distribution_as_percent: false
+fallback_compare_order: ["QOQ","YOY"]
