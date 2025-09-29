@@ -1152,12 +1152,26 @@ def process_topic(topic: str,
                 }
                 ctx.add_figure(figure_data, chart_type)
                 
-                # Build data card
+                # Build data card with chart-specific context
                 composition_base = None
+                delta_type = None
+                tier_col = None
+                analysis_mode = analysis_hint
+                
                 if chart_type == 'A3':
                     composition_base = select_composition_base(src_df, metric)
+                    tier_col = extract_tier_columns(src_df)
+                    tier_col = tier_col[0] if tier_col else None
+                elif chart_type == 'A4':
+                    delta_type = force_delta_type or (family_resolution['short_delta'] if family_resolution else 'yoy')
                 
-                data_card = build_data_card(src_df, metric, chart_type, composition_base=composition_base)
+                data_card = build_data_card(
+                    src_df, metric, chart_type, 
+                    composition_base=composition_base,
+                    delta_type=delta_type,
+                    tier_col=tier_col,
+                    analysis_mode=analysis_mode
+                )
                 
                 # Generate narrative
                 narrative = llm_narrate(data_card, config)
@@ -1409,7 +1423,10 @@ def process_topic(topic: str,
                                     config,
                                 )
                                 trend_chart_title = f"{base_phrase} Trend"
-                                trend_card = build_data_card(prepared_trend, avail[0], 'A2')
+                                trend_card = build_data_card(
+                                    prepared_trend, avail[0], 'A2',
+                                    analysis_mode='TRENDS'
+                                )
                                 trend_narrative = llm_narrate(trend_card, config)
                                 add_chart_slide(
                                     presentation,
@@ -1463,6 +1480,8 @@ def process_topic(topic: str,
                                     avail[0],
                                     'A3',
                                     composition_base='credit_tier',
+                                    tier_col=tier_col,
+                                    analysis_mode='SNAPSHOT'
                                 )
                                 severity_narrative = llm_narrate(severity_card, config)
                                 add_chart_slide(
@@ -1786,7 +1805,11 @@ def process_topic(topic: str,
                         }
                         ctx.add_figure(figure_data, yoy_chart_type)
 
-                        data_card2 = build_data_card(src_df, metric, yoy_chart_type)
+                        data_card2 = build_data_card(
+                            src_df, metric, yoy_chart_type,
+                            delta_type='yoy',
+                            analysis_mode='YOY'
+                        )
                         narrative2 = llm_narrate(data_card2, config)
 
                         # Compute headline for YoY
@@ -1915,8 +1938,11 @@ def process_topic(topic: str,
                 
                 # Continue with a stub narrative even if chart fails
                 try:
-                    # Create minimal data card
-                    data_card = build_data_card(src_df, metric, 'A2')
+                    # Create minimal data card with chart context
+                    data_card = build_data_card(
+                        src_df, metric, 'A2',
+                        analysis_mode='TRENDS'
+                    )
                     
                     # Generate narrative anyway
                     narrative = llm_narrate(data_card, config)
