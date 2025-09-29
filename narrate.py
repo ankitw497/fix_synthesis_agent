@@ -34,8 +34,8 @@ def build_data_card(df: pd.DataFrame,
                    period_col: str = 'period',
                    composition_base: Optional[str] = None) -> Dict[str, Any]:
     """
-    Build data card with all facts for LLM.
-    CRITICAL: Include composition_base for A3 charts.
+    Build data card with facts appropriate for the chart type.
+    CRITICAL: A3 charts must focus on tier analysis, A2 charts on trends.
     
     Args:
         df: DataFrame with data
@@ -45,21 +45,29 @@ def build_data_card(df: pd.DataFrame,
         composition_base: Base period for composition (A3 only)
     
     Returns:
-        Data card dictionary
+        Data card dictionary with chart-specific analysis
     """
-    # Determine visualization type based on chart type
+    # Strictly classify visualization type based on chart type
+    # This ensures appropriate narrative generation later
     visualization_type = 'generic'
-    if chart_type in ['A2', 'trend']:
+    
+    # Map chart_type to standard types for consistent handling
+    chart_type_normalized = chart_type.upper() if isinstance(chart_type, str) else ''
+    
+    if chart_type_normalized in ['A2', 'LINE_TREND_A2']:
         visualization_type = 'trend'
-    elif chart_type in ['A3', 'composition']:
+    elif chart_type_normalized in ['A3', 'STACKED100_A3']:
         visualization_type = 'tier_distribution'
-    elif chart_type in ['A4', 'delta']:
+    elif chart_type_normalized in ['A4', 'DELTA_OVER_TIME_A4', 'COUNTS_DELTAS_A4']:
         visualization_type = 'delta_comparison'
-    elif chart_type in ['A5', 'dual_axis']:
+    elif chart_type_normalized in ['A5', 'DUAL_AXIS_A5']:
         visualization_type = 'trend_with_comparison'
-    elif '30_60_90' in str(chart_type):
+    elif '30_60_90' in str(chart_type_normalized):
         visualization_type = 'delinquency_comparison'
-        
+    
+    # Log the chart type and visualization type for debugging
+    logger.debug(f"Chart type '{chart_type}' mapped to visualization type '{visualization_type}'")
+    
     card = {
         'visualization_type': visualization_type,  # Add visualization type
         'metric': metric,
@@ -476,7 +484,12 @@ def _build_insight_prompt(data_card: Dict[str, Any], config: SynthesisConfig) ->
     
     # Check visualization type to route to specialized prompt builder
     viz_type = data_card.get('visualization_type', 'generic')
+    chart_type = data_card.get('chart_type', 'unknown')
     
+    # Log chart type and viz type to help with debugging
+    logger.debug(f"Building insight prompt for chart_type={chart_type}, viz_type={viz_type}")
+    
+    # Route to specialized prompt builders based on visualization type
     if viz_type == 'tier_distribution':
         return _build_tier_insight_prompt(data_card, config)
     elif viz_type == 'trend':
@@ -547,32 +560,41 @@ def _build_tier_insight_prompt(data_card: Dict[str, Any], config: SynthesisConfi
     dominant_tier = tier_analysis.get('dominant_tier', 'Unknown')
     tier_shares = tier_analysis.get('tier_shares', {})
     
+    # Get tier breakdown if available
+    tier_breakdown = ""
+    if tier_shares:
+        tier_breakdown = "Tier breakdown:\n"
+        for tier, share in tier_shares.items():
+            tier_breakdown += f"- {tier}: {share:.1f}%\n"
+    
     prompt = f"""
-    Generate an executive insight about the credit tier distribution for {metric_name} with the following constraints:
+    Generate an executive insight SPECIFICALLY ABOUT THE CREDIT TIER DISTRIBUTION for {metric_name}.
 
-    STRICT REQUIREMENTS:
-    - Focus primarily on the credit tier composition and what it reveals about risk distribution
-    - Highlight the dominant tier ({dominant_tier}) and its significance
-    - Compare the performance across different credit tiers
-    - Note any significant shifts between tiers or concentration of risk
-    - Keep the title under {limits['title_max_chars']} characters
-    - Include 2-4 bullet points, each under {limits['bullet_max_chars']} characters
-    - Keep the strapline under {limits['strapline_max_chars']} characters
-    - Avoid using jargon or overly technical language
-    - Focus on tier composition insights relevant to risk and portfolio managers
-    - Be specific about tier performance rather than generic observations
+    CRITICAL REQUIREMENTS:
+    - ALWAYS begin title with "Credit Tier Analysis:" or "Tier Distribution:" 
+    - EVERY bullet point MUST mention specific tiers (SUPER_PRIME, PRIME, NEAR_PRIME, SUBPRIME, etc.)
+    - Focus EXCLUSIVELY on the tier distribution - DO NOT discuss overall trends
+    - Highlight the dominant tier ({dominant_tier}) and explain its significance
+    - Compare proportions across different tiers and note which are growing/shrinking
+    - Note any risk concentration in specific tiers
+    - Be specific with tier percentages when possible
+    - Keep the title under {limits.get('title_max_chars', 80)} characters
+    - Include 2-4 bullet points, each under {limits.get('bullet_max_chars', 120)} characters
+    - Keep the strapline under {limits.get('strapline_max_chars', 100)} characters
+    
+    {tier_breakdown}
     
     DATA FACTS:
     {data_card['key_facts']}
     
     OUTPUT FORMAT:
     {{
-        "title": "Credit Tier Distribution Insight - Brief, specific, and clear",
-        "strapline": "One-sentence summary that highlights the most important tier-related insight",
+        "title": "Credit Tier Analysis: [specific insight about tier mix]",
+        "strapline": "One-sentence highlighting tier-specific findings",
         "bullets": [
-            "Key insight about dominant tier and its implications",
-            "Notable observation about tier distribution and risk",
-            "Insight about significant changes in tier composition"
+            "SUPER_PRIME accounts for X% of [metric], indicating...",
+            "SUBPRIME tier shows significant change of X%, suggesting...",
+            "Distribution across tiers reveals concentration in X tier..."
         ]
     }}
     """
@@ -591,31 +613,31 @@ def _build_trend_insight_prompt(data_card: Dict[str, Any], config: SynthesisConf
     change_pct = data_card.get('change_pct_formatted', data_card.get('change_pct', 'N/A'))
     
     prompt = f"""
-    Generate an executive insight about the trend for {metric_name} with the following constraints:
+    Generate an executive insight about the OVERALL TREND for {metric_name}.
 
-    STRICT REQUIREMENTS:
-    - Focus primarily on the time-based trend and pattern over the period
+    CRITICAL REQUIREMENTS:
+    - ALWAYS begin title with "Trend Analysis:" or "Performance Trend:" 
+    - NEVER mention credit tiers (SUPER_PRIME, PRIME, NEAR_PRIME, SUBPRIME) - this is an aggregate view only
+    - Focus EXCLUSIVELY on the time-series trend of the TOTAL metric across all periods
     - Highlight key turning points, acceleration, or deceleration in the trend
-    - Note any seasonality or cyclical patterns if evident
+    - Identify any seasonality or cyclical patterns if evident
     - Compare the latest value ({latest_value}) with the earliest value ({earliest_value})
-    - Mention the overall change ({change_pct}) and its significance
-    - Keep the title under {limits['title_max_chars']} characters
-    - Include 2-4 bullet points, each under {limits['bullet_max_chars']} characters
-    - Keep the strapline under {limits['strapline_max_chars']} characters
-    - Avoid using jargon or overly technical language
-    - Focus on trend insights relevant to business decisions
+    - Note the overall change ({change_pct}) and its business significance
+    - Keep the title under {limits.get('title_max_chars', 80)} characters
+    - Include 2-4 bullet points, each under {limits.get('bullet_max_chars', 120)} characters
+    - Keep the strapline under {limits.get('strapline_max_chars', 100)} characters
     
     DATA FACTS:
     {data_card['key_facts']}
     
     OUTPUT FORMAT:
     {{
-        "title": "Trend Analysis Insight - Brief, specific, and clear",
-        "strapline": "One-sentence summary that captures the most important trend",
+        "title": "Trend Analysis: [specific insight about overall trend]",
+        "strapline": "One-sentence summary capturing the trend direction and magnitude",
         "bullets": [
-            "Key insight about the overall trend direction and magnitude",
-            "Notable observation about pattern changes or inflection points",
-            "Business implication of the observed trend"
+            "Overall trend shows [direction] of [X%] from [start period] to [end period]",
+            "Notable [acceleration/deceleration/inflection] observed during [specific period]",
+            "Business implication of this trend suggests [strategic insight]"
         ]
     }}
     """
@@ -633,31 +655,31 @@ def _build_delta_insight_prompt(data_card: Dict[str, Any], config: SynthesisConf
     delta_value = data_card.get('delta_formatted', data_card.get('delta', 'N/A'))
     
     prompt = f"""
-    Generate an executive insight about the {delta_type} change in {metric_name} with the following constraints:
+    Generate an executive insight about the {delta_type} CHANGE in {metric_name}.
 
-    STRICT REQUIREMENTS:
-    - Focus primarily on the period-over-period comparison and what it reveals
-    - Highlight the magnitude and direction of change ({delta_value})
-    - Compare this change to historical patterns or expectations
-    - Note any significant acceleration or deceleration in the rate of change
-    - Keep the title under {limits['title_max_chars']} characters
-    - Include 2-4 bullet points, each under {limits['bullet_max_chars']} characters
-    - Keep the strapline under {limits['strapline_max_chars']} characters
-    - Avoid using jargon or overly technical language
-    - Focus on comparative insights relevant to business decisions
-    - Be specific about what the delta reveals rather than just stating the change
+    CRITICAL REQUIREMENTS:
+    - ALWAYS begin title with "{delta_type} Change:" or "{delta_type} Comparison:" 
+    - This chart shows CHANGE between periods, not trends or tier breakdowns
+    - Focus EXCLUSIVELY on period-over-period changes and their significance
+    - Highlight the magnitude and direction of the most recent change ({delta_value})
+    - Compare recent changes to historical patterns or expectations
+    - Note any acceleration or deceleration in the rate of change
+    - Analyze what these changes reveal about portfolio performance
+    - Keep the title under {limits.get('title_max_chars', 80)} characters
+    - Include 2-4 bullet points, each under {limits.get('bullet_max_chars', 120)} characters
+    - Keep the strapline under {limits.get('strapline_max_chars', 100)} characters
     
     DATA FACTS:
     {data_card['key_facts']}
     
     OUTPUT FORMAT:
     {{
-        "title": "{delta_type} Comparison Insight - Brief, specific, and clear",
-        "strapline": "One-sentence summary that captures the most important comparative finding",
+        "title": "{delta_type} Change: [specific insight about period-over-period change]",
+        "strapline": "One-sentence summary about the significance of the observed changes",
         "bullets": [
-            "Key insight about the magnitude and direction of change",
-            "Notable observation about what this change reveals",
-            "Business implication of the observed change"
+            "{delta_type} change of [specific value/percentage] represents [acceleration/deceleration]",
+            "Changes are [consistent/inconsistent/volatile] compared to historical patterns",
+            "These changes suggest [specific business implication or forward-looking insight]"
         ]
     }}
     """
