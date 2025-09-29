@@ -155,6 +155,52 @@ def _descriptive_chart_title(
     return f"{base} — {suffix}"
 
 
+def _augment_data_card(
+    data_card: Dict[str, Any],
+    chart_type: str,
+    short_delta: Optional[str],
+    source_df: Optional[pd.DataFrame] = None,
+) -> None:
+    """Attach view metadata so prompts/titles stay view-aware."""
+
+    view = {'A2': 'trend', 'A3': 'composition', 'A4': 'delta'}.get(chart_type)
+    if view:
+        data_card['view'] = view
+
+    if chart_type == 'A4':
+        if short_delta:
+            data_card['delta_type'] = short_delta.upper()
+    elif chart_type == 'A3':
+        split_col: Optional[str] = None
+        if source_df is not None:
+            tier_cols = extract_tier_columns(source_df)
+            if tier_cols:
+                split_col = tier_cols[0]
+            elif 'score_curr_tier' in source_df.columns:
+                split_col = 'score_curr_tier'
+            elif 'score_tier' in source_df.columns:
+                split_col = 'score_tier'
+        if split_col:
+            data_card['split_by'] = split_col
+
+
+def _needs_view_tag(title: str, chart_type: str, short_delta: Optional[str]) -> bool:
+    text = (title or '').lower()
+    if chart_type == 'A2':
+        return not any(token in text for token in ('trend', 'over time'))
+    if chart_type == 'A3':
+        return not any(token in text for token in ('tier', 'mix', 'composition'))
+    if chart_type == 'A4':
+        delta = (short_delta or '').lower()
+        if delta == 'qoq':
+            tags = ('qoq', 'quarter-over-quarter', 'q/q')
+        elif delta == 'yoy':
+            tags = ('yoy', 'year-over-year', 'y/y')
+        else:
+            tags = ('period-over-period', 'change', 'delta')
+        return not any(token in text for token in tags)
+    return False
+
 
 def _focus_suffix_from_period(period: Optional[str]) -> Optional[str]:
     """Return a canonical focus suffix (e.g., 'Q2') from a period label."""
@@ -1158,7 +1204,8 @@ def process_topic(topic: str,
                     composition_base = select_composition_base(src_df, metric)
                 
                 data_card = build_data_card(src_df, metric, chart_type, composition_base=composition_base)
-                
+                _augment_data_card(data_card, chart_type, short_delta, src_df)
+
                 # Generate narrative
                 narrative = llm_narrate(data_card, config)
                 results['narratives_generated'] += 1
@@ -1326,6 +1373,15 @@ def process_topic(topic: str,
                             (family_resolution or {}).get('granularity', 'quarterly').lower()
                             == 'quarterly'
                         )
+                        desc_focus = focus_upper if (periodic_enabled and focus_upper and is_quarterly) else None
+                        desc_title = _descriptive_chart_title(
+                            metric,
+                            chart_type,
+                            short_delta,
+                            desc_focus,
+                        )
+                        if _needs_view_tag(insight_title, chart_type, short_delta):
+                            insight_title = f"{desc_title} — {insight_title}" if insight_title else desc_title
 
                         if group_lower.startswith('delinquen'):
                             # Handle delinquency charts as a special group: build
@@ -1410,6 +1466,7 @@ def process_topic(topic: str,
                                 )
                                 trend_chart_title = f"{base_phrase} Trend"
                                 trend_card = build_data_card(prepared_trend, avail[0], 'A2')
+                                _augment_data_card(trend_card, 'A2', short_delta, prepared_trend)
                                 trend_narrative = llm_narrate(trend_card, config)
                                 add_chart_slide(
                                     presentation,
@@ -1464,6 +1521,7 @@ def process_topic(topic: str,
                                     'A3',
                                     composition_base='credit_tier',
                                 )
+                                _augment_data_card(severity_card, 'A3', short_delta, latest_df)
                                 severity_narrative = llm_narrate(severity_card, config)
                                 add_chart_slide(
                                     presentation,
@@ -1705,6 +1763,17 @@ def process_topic(topic: str,
                             insight_title = sanitized_title
                         else:
                             insight_title = 'Key Insight'
+                    desc_focus = None
+                    if 'focus_upper' in locals() and focus_upper and 'periodic_enabled' in locals() and periodic_enabled and 'is_quarterly' in locals() and is_quarterly:
+                        desc_focus = focus_upper
+                    desc_title = _descriptive_chart_title(
+                        metric,
+                        chart_type,
+                        short_delta,
+                        desc_focus,
+                    )
+                    if _needs_view_tag(insight_title, chart_type, short_delta):
+                        insight_title = f"{desc_title} — {insight_title}" if insight_title else desc_title
                     add_insight_slide(
                         presentation,
                         insight_title,
@@ -1787,6 +1856,7 @@ def process_topic(topic: str,
                         ctx.add_figure(figure_data, yoy_chart_type)
 
                         data_card2 = build_data_card(src_df, metric, yoy_chart_type)
+                        _augment_data_card(data_card2, yoy_chart_type, 'yoy', src_df)
                         narrative2 = llm_narrate(data_card2, config)
 
                         # Compute headline for YoY
@@ -1872,6 +1942,17 @@ def process_topic(topic: str,
                                                     delta_type,
                                                     focus_upper if 'focus_upper' in locals() else None,
                                                 )
+                                        desc_focus2 = None
+                                        if 'focus_upper' in locals() and focus_upper and 'periodic_enabled' in locals() and periodic_enabled and 'is_quarterly' in locals() and is_quarterly:
+                                            desc_focus2 = focus_upper
+                                        desc_title2 = _descriptive_chart_title(
+                                            metric,
+                                            yoy_chart_type,
+                                            delta_type,
+                                            desc_focus2,
+                                        )
+                                        if _needs_view_tag(insight_title2, yoy_chart_type, delta_type):
+                                            insight_title2 = f"{desc_title2} — {insight_title2}" if insight_title2 else desc_title2
                                         add_insight_slide(
                                             presentation,
                                             insight_title2,
@@ -1917,6 +1998,7 @@ def process_topic(topic: str,
                 try:
                     # Create minimal data card
                     data_card = build_data_card(src_df, metric, 'A2')
+                    _augment_data_card(data_card, 'A2', (family_resolution or {}).get('short_delta'), src_df)
                     
                     # Generate narrative anyway
                     narrative = llm_narrate(data_card, config)
@@ -1949,6 +2031,14 @@ def process_topic(topic: str,
                                     insight_title = sanitized_title
                                 else:
                                     insight_title = chart_title
+                            desc_title = _descriptive_chart_title(
+                                metric,
+                                chart_type,
+                                (family_resolution or {}).get('short_delta'),
+                                None,
+                            )
+                            if _needs_view_tag(insight_title, chart_type, (family_resolution or {}).get('short_delta')):
+                                insight_title = f"{desc_title} — {insight_title}" if insight_title else desc_title
                             add_insight_slide(
                                 presentation,
                                 insight_title,

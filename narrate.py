@@ -59,7 +59,10 @@ def build_data_card(df: pd.DataFrame,
         'trend': None,
         'volatility': None,
         'composition_base': composition_base,  # CRITICAL for A3
-        'key_facts': []
+        'key_facts': [],
+        'view': None,
+        'delta_type': None,
+        'split_by': None,
     }
     
     # Extract period range
@@ -364,6 +367,22 @@ FORMAT:
 }}
 """
 
+    view = (data_card.get('view') or '').lower()
+    delta_type = (data_card.get('delta_type') or '').upper()
+    split_by = (data_card.get('split_by') or '')
+
+    if view == 'trend':
+        prompt += "\nTITLE MUST explicitly reference a trend over time (use words like 'Trend' or 'Over time') and mention the time window."  # noqa: E501
+    elif view == 'composition':
+        prompt += "\nTITLE MUST call out the credit tier mix and specify which tiers gained or lost share."
+        if 'tier' in split_by.lower():
+            prompt += "\nALWAYS mention at least one credit tier (e.g., Prime, Near-Prime, Subprime) when describing the changes."  # noqa: E501
+    elif view == 'delta':
+        if delta_type in ('QOQ', 'YOY'):
+            prompt += f"\nTITLE MUST explicitly mention {delta_type} change and highlight the largest increases or decreases."
+        else:
+            prompt += "\nTITLE MUST call out period-over-period change and identify the strongest movers."
+
     if data_card.get('composition_base'):
         prompt += (
             f"\nIMPORTANT: Composition based on {data_card['composition_base']}"
@@ -624,15 +643,26 @@ def stub_llm_narrative(data_card: Dict[str, Any], config: SynthesisConfig,
         Stub narrative dictionary
     """
     metric = data_card.get('metric', 'Data')
-    chart_type = data_card.get('chart_type', '')
-    
-    # Generate deterministic narrative based on data
-    title = f"Analysis of {metric.replace('_', ' ').title()}"
-    
+    metric_label = metric.replace('_', ' ').title()
+    view = (data_card.get('view') or '').lower()
+    delta_type = (data_card.get('delta_type') or '').upper()
+
+    if view == 'composition':
+        title = f"{metric_label} — Credit tier mix"
+    elif view == 'delta':
+        if delta_type in ('QOQ', 'YOY'):
+            title = f"{metric_label} — {delta_type} change"
+        else:
+            title = f"{metric_label} — Period-over-period change"
+    elif view == 'trend':
+        title = f"{metric_label} — Trend over time"
+    else:
+        title = f"{metric_label} — Performance overview"
+
     bullets = []
     if data_card.get('latest_value') is not None and data_card.get('earliest_value') is not None:
         bullets.append(f"Current value: {data_card['latest_value']}, initial: {data_card['earliest_value']}")
-    
+
     if data_card.get('trend_direction'):
         bullets.append(f"Trend shows {data_card['trend_direction']} movement")
     
@@ -641,15 +671,30 @@ def stub_llm_narrative(data_card: Dict[str, Any], config: SynthesisConfig,
             if value is not None:
                 bullets.append(f"{delta_type}: {value}")
     
+    if view == 'composition':
+        dominant_fact = next(
+            (fact for fact in data_card.get('key_facts', []) if str(fact).lower().startswith('dominant tier')),
+            None,
+        )
+        tier_bullet = dominant_fact or "Credit tier mix shifts across tiers"
+        bullets.insert(0, tier_bullet)
+
     # Ensure at least 2 bullets
     while len(bullets) < 2:
         bullets.append(f"Pattern detected in {metric.replace('_', ' ')} data")
-    
+
     # Cap at 3 bullets
     bullets = bullets[:3]
-    
-    strapline = f"Key insight: {metric.replace('_', ' ')} shows measurable change over the period"
-    
+
+    if view == 'composition':
+        strapline = f"{metric_label} tiers show mix shifts across credit bands"
+    elif view == 'delta' and delta_type in ('QOQ', 'YOY'):
+        strapline = f"{metric_label} {delta_type} change spotlights leading movers"
+    elif view == 'trend':
+        strapline = f"{metric_label} trend highlights momentum over time"
+    else:
+        strapline = f"Key insight: {metric.replace('_', ' ')} shows measurable change over the period"
+
     return {
         'title': title[:NARRATIVE_LIMITS['title_max_chars']],
         'bullets': bullets,
@@ -700,6 +745,40 @@ def _validate_narrative(narrative: Dict[str, str], config: SynthesisConfig,
     if len(strapline) > NARRATIVE_LIMITS['strapline_max_chars']:
         issues.append(f"Strapline too long: {len(strapline)} > {NARRATIVE_LIMITS['strapline_max_chars']}")
     
+    view = (data_card or {}).get('view') if data_card else None
+    view_lower = str(view).lower() if view else ''
+    delta_type = (data_card or {}).get('delta_type') if data_card else None
+    delta_upper = str(delta_type).upper() if delta_type else ''
+    title_lower = title.lower()
+
+    if view_lower == 'trend':
+        if not any(token in title_lower for token in ('trend', 'over time')):
+            issues.append("Title must mention trend or over time")
+    elif view_lower == 'composition':
+        if not any(token in title_lower for token in ('tier', 'mix', 'composition')):
+            issues.append("Title must include credit tier mix")
+        tier_tokens = ('prime', 'near-prime', 'subprime', 'super-prime', 'deep subprime')
+        tier_present = any(token in title_lower for token in tier_tokens)
+        if not tier_present:
+            for bullet in bullets:
+                if isinstance(bullet, str) and any(token in bullet.lower() for token in tier_tokens):
+                    tier_present = True
+                    break
+        if not tier_present:
+            issues.append("Narrative must reference at least one credit tier")
+    elif view_lower == 'delta':
+        if delta_upper == 'QOQ':
+            tokens = ('qoq', 'quarter-over-quarter', 'q/q')
+            if not any(token in title_lower for token in tokens):
+                issues.append("Title must include QoQ phrasing")
+        elif delta_upper == 'YOY':
+            tokens = ('yoy', 'year-over-year', 'y/y')
+            if not any(token in title_lower for token in tokens):
+                issues.append("Title must include YoY phrasing")
+        else:
+            if not any(token in title_lower for token in ('change', 'delta', 'period-over-period')):
+                issues.append("Title must highlight period-over-period change")
+
     # STRICT NUMERIC GUARD: Check all numbers against data card
     if data_card:
         all_text = title + ' ' + ' '.join(bullets) + ' ' + strapline
