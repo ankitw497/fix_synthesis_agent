@@ -154,37 +154,45 @@ def _descriptive_chart_title(
 
 
 def _trend_chart_title(metric: str, focus_label: Optional[str] = None) -> str:
-    """Generate title for trend charts (A2)."""
+    """Generate title for trend charts (A2).
+    
+    IMPORTANT: Never mention tier information in trend titles.
+    """
     base = pretty_label(metric)
     focus_words = _quarter_label_to_words(focus_label)
     
     if focus_words:
-        suffix = f"{focus_words} trend across years"
+        suffix = f"{focus_words} Overall Trend"
     else:
-        suffix = "Trend over time"
+        suffix = "Overall Trend Performance"
         
+    # Ensure proper capitalization in the title
     return f"{base} — {suffix}"
 
 
 def _tier_chart_title(metric: str, short_delta: Optional[str], focus_label: Optional[str]) -> str:
-    """Generate title for tier distribution charts (A3)."""
+    """Generate title for tier distribution charts (A3).
+    
+    IMPORTANT: Always emphasize tier breakdown in title.
+    """
     base = pretty_label(metric)
     
+    # Always include 'By Credit Tier' or similar in title
     # Create different titles for tier charts based on delta type
     if short_delta and short_delta.lower() == 'qoq':
-        return f"{base} — Quarter-over-Quarter Credit Tier Distribution"
+        return f"{base} by Credit Tier — Quarter-over-Quarter Comparison"
     elif short_delta and short_delta.lower() == 'yoy':
-        return f"{base} — Year-over-Year Credit Tier Composition"
+        return f"{base} by Credit Tier — Year-over-Year Analysis"
     elif short_delta and short_delta.lower() == 'mom':
-        return f"{base} — Month-over-Month Credit Tier Distribution"
+        return f"{base} by Credit Tier — Month-over-Month Analysis"
     
     # Fallback based on focus period
     if focus_label:
         focus_words = _quarter_label_to_words(focus_label)
         if focus_words:
-            return f"{base} — {focus_words} Credit Tier Breakdown"
+            return f"{base} by Credit Tier — {focus_words} Breakdown"
     
-    return f"{base} — Credit Tier Distribution Analysis"
+    return f"{base} by Credit Tier — Distribution Analysis"
 
 
 def _delta_chart_title(metric: str, short_delta: Optional[str]) -> str:
@@ -991,7 +999,7 @@ def process_topic(topic: str,
         
         # Process available metrics
         metrics_processed = set()
-        chart_types_generated = set()  # Track which chart types we've generated
+        chart_types_by_metric = {}  # Track which chart types we've generated for each metric
 
         # Special handling for delinquency groups: generate all slides once and skip per-metric loop
         if group_name.lower().startswith('delinquen') and presentation and not ctx.dry_run:
@@ -1060,7 +1068,9 @@ def process_topic(topic: str,
                     }
                 )
                 coverage_ledger.mark_coverage(topic, group_name, avail[0], 'A2')
-                chart_types_generated.add('A2')
+                if avail[0] not in chart_types_by_metric:
+                    chart_types_by_metric[avail[0]] = set()
+                chart_types_by_metric[avail[0]].add('A2')
                 results['slides_created'] += 1
 
                 sev_spec = build_dpd_severity_spec(
@@ -1099,7 +1109,9 @@ def process_topic(topic: str,
                     }
                 )
                 coverage_ledger.mark_coverage(topic, group_name, avail[0], 'A4')
-                chart_types_generated.add('A4')
+                if avail[0] not in chart_types_by_metric:
+                    chart_types_by_metric[avail[0]] = set()
+                chart_types_by_metric[avail[0]].add('A4')
                 results['slides_created'] += 1
             ctx.topic_has_image[topic] = False
             continue
@@ -1139,10 +1151,18 @@ def process_topic(topic: str,
                 else:
                     chart_type = "A2"  # Default fallback
             
-            # Force at least one Trend (A2) per group to ensure coverage
-            if 'A2' not in chart_types_generated and 'snapshot' not in str(analysis_hint).lower():
+            # Check for redundant chart types to avoid duplication per metric
+            if metric not in chart_types_by_metric:
+                chart_types_by_metric[metric] = set()
+                
+            if chart_type in chart_types_by_metric[metric]:
+                logger.info(f"Skipping redundant {chart_type} chart for {metric} - already generated for this metric")
+                continue
+                
+            # Force at least one Trend (A2) per metric to ensure coverage
+            if 'A2' not in chart_types_by_metric.get(metric, set()) and 'snapshot' not in str(analysis_hint).lower():
                 chart_type = 'A2'
-                logger.debug(f"Forcing A2 for {metric} to ensure group has at least one trend chart")
+                logger.debug(f"Forcing A2 for {metric} to ensure it has at least one trend chart")
             
             # choose the dataframe to actually plot
             src_df = union
@@ -1491,7 +1511,9 @@ def process_topic(topic: str,
                                     'strapline': trend_narrative.get('strapline', ''),
                                 })
                                 coverage_ledger.mark_coverage(topic, group_name, avail[0], 'A2')
-                                chart_types_generated.add('A2')
+                                if avail[0] not in chart_types_by_metric:
+                                    chart_types_by_metric[avail[0]] = set()
+                                chart_types_by_metric[avail[0]].add('A2')
                                 results['slides_created'] += 1
 
                                 sev_spec = build_dpd_severity_spec(
@@ -1545,7 +1567,9 @@ def process_topic(topic: str,
                                     'strapline': severity_narrative.get('strapline', ''),
                                 })
                                 coverage_ledger.mark_coverage(topic, group_name, avail[0], 'A3')
-                                chart_types_generated.add('A3')
+                                if metric not in chart_types_by_metric:
+                                    chart_types_by_metric[metric] = set()
+                                chart_types_by_metric[metric].add('A3')
                                 results['slides_created'] += 1
                             ctx.topic_has_image[topic] = False
                             continue
@@ -1588,7 +1612,9 @@ def process_topic(topic: str,
                                     'content_count': 1
                                 })
                                 coverage_ledger.mark_coverage(topic, group_name, metric, 'A2')
-                                chart_types_generated.add('A2')
+                                if metric not in chart_types_by_metric:
+                                    chart_types_by_metric[metric] = set()
+                                chart_types_by_metric[metric].add('A2')
                                 results['slides_created'] += 1
 
                             if (
@@ -1625,7 +1651,9 @@ def process_topic(topic: str,
                                     }
                                 )
                                 coverage_ledger.mark_coverage(topic, group_name, metric, 'A2')
-                                chart_types_generated.add('A2')
+                                if metric not in chart_types_by_metric:
+                                    chart_types_by_metric[metric] = set()
+                                chart_types_by_metric[metric].add('A2')
                                 results['slides_created'] += 1
                                 multi_periods_for_tiers = list(per_periods)
                                 multi_focus_label = fq
@@ -1696,7 +1724,9 @@ def process_topic(topic: str,
                                     'content_count': 1
                                 })
                                 coverage_ledger.mark_coverage(topic, group_name, metric, 'A4')
-                                chart_types_generated.add('A4')
+                                if metric not in chart_types_by_metric:
+                                    chart_types_by_metric[metric] = set()
+                                chart_types_by_metric[metric].add('A4')
                                 results['slides_created'] += 1
 
                             if comparison_period:
@@ -1723,7 +1753,9 @@ def process_topic(topic: str,
                                     'content_count': 1
                                 })
                                 coverage_ledger.mark_coverage(topic, group_name, metric, 'A4')
-                                chart_types_generated.add('A4')
+                                if metric not in chart_types_by_metric:
+                                    chart_types_by_metric[metric] = set()
+                                chart_types_by_metric[metric].add('A4')
                                 results['slides_created'] += 1
                             ctx.topic_has_image[topic] = False
                             continue
@@ -1783,7 +1815,9 @@ def process_topic(topic: str,
                     ctx.topic_has_image[topic] = True
                     chart_type_for_coverage = 'A2' if chart_type == 'A5' else chart_type
                     coverage_ledger.mark_coverage(topic, group_name, metric, chart_type_for_coverage)
-                    chart_types_generated.add(chart_type)
+                    if metric not in chart_types_by_metric:
+                        chart_types_by_metric[metric] = set()
+                    chart_types_by_metric[metric].add(chart_type)
                     results['slides_created'] += 1
 
                     # Track slide artifact
@@ -1959,7 +1993,9 @@ def process_topic(topic: str,
                                             topic, group_name, metric, chart_type_for_coverage,
                                             fallback=False, narrative_type=narrative_type
                                         )
-                                        chart_types_generated.add(yoy_chart_type)
+                                        if metric not in chart_types_by_metric:
+                                            chart_types_by_metric[metric] = set()
+                                        chart_types_by_metric[metric].add(yoy_chart_type)
                                         results['slides_created'] += 1
                                         ctx.add_slide(
                                             {
@@ -2046,12 +2082,17 @@ def process_topic(topic: str,
                     logger.error(f"Also failed to generate narrative for {metric}: {narr_e}")
         
         # After processing all metrics, check if we have all chart types
-        if available_metrics and not chart_types_generated:
+        if available_metrics and not chart_types_by_metric:
             logger.warning(f"No charts generated for {group_name} despite having {len(available_metrics)} metrics")
         elif available_metrics:
-            missing_types = {'A2', 'A3', 'A4'} - chart_types_generated
-            if missing_types:
-                logger.debug(f"Group {group_name}: Generated {chart_types_generated}, missing {missing_types}")
+            # Check if any metrics are missing important chart types
+            for metric in available_metrics:
+                if metric not in chart_types_by_metric or not chart_types_by_metric[metric]:
+                    logger.warning(f"No charts generated for metric {metric} in group {group_name}")
+                else:
+                    missing_types = {'A2', 'A3', 'A4'} - chart_types_by_metric[metric]
+                    if missing_types:
+                        logger.debug(f"Metric {metric} in group {group_name}: Generated {chart_types_by_metric[metric]}, missing {missing_types}")
     
     return results
 
