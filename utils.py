@@ -425,21 +425,51 @@ def pretty_label(col: str) -> str:
     c = col.lower()
     if c in DISPLAY_LABELS:
         return DISPLAY_LABELS[c]
+        
+    # Create a more complete dictionary of common abbreviations
+    abbreviations = {
+        'avg': 'Average',
+        'tot': 'Total',
+        'cnsmr': 'Consumer',
+        'acct': 'Account',
+        'bal': 'Balance',
+        'deliq': 'Delinquent',
+        'num': 'Number',
+        'cnt': 'Count',
+        'cnts': 'Counts',
+        'pct': 'Percentage',
+        'amt': 'Amount',
+        'vol': 'Volume',
+        'cr': 'Credit',
+        'w': 'With',
+        'wo': 'Without',
+        'min': 'Minimum',
+        'max': 'Maximum',
+        'util': 'Utilization',
+        'freq': 'Frequency'
+    }
+    
     # Heuristics for unknown columns
     if c.endswith('_rate'):
         base = c[:-5].replace('_', ' ')
-        base = base.replace('cnsmr', 'consumer').replace('acct', 'account')
-        return base.title() + ' rate'
+        for abbr, full in abbreviations.items():
+            base = re.sub(r'\b' + abbr + r'\b', full.lower(), base)
+        return base.title() + ' Rate'
+        
     if c.endswith('_pct'):
         base = c[:-4].replace('_', ' ')
+        for abbr, full in abbreviations.items():
+            base = re.sub(r'\b' + abbr + r'\b', full.lower(), base)
         return base.title() + ' (%)'
+    
     # Generic cleanup
     cleaned = col.replace('_', ' ')
-    cleaned = cleaned.replace('cnsmr', 'consumer').replace('acct', 'account')
-    cleaned = cleaned.replace('tot', 'total').replace('avg', 'average')
+    
+    # Apply all abbreviation expansions
+    for abbr, full in abbreviations.items():
+        cleaned = re.sub(r'\b' + abbr + r'\b', full.lower(), cleaned)
+        
     return cleaned.title()
-
-
 def fmt_value(val, metric: str) -> str:
     """Format value based on metric type."""
     if pd.isna(val):
