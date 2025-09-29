@@ -14,7 +14,7 @@ from synthesis_agent.config import (
     NARRATIVE_LIMITS, SynthesisConfig
 )
 from synthesis_agent.utils import (
-    fmt_currency, fmt_percent, fmt_delta, setup_logging
+    fmt_currency, fmt_percent, fmt_delta, setup_logging, pretty_label
 )
 # Import metric-aware aggregation from charts module
 try:
@@ -47,18 +47,38 @@ def build_data_card(df: pd.DataFrame,
     Returns:
         Data card dictionary
     """
+    # Determine visualization type based on chart type
+    visualization_type = 'generic'
+    if chart_type in ['A2', 'trend']:
+        visualization_type = 'trend'
+    elif chart_type in ['A3', 'composition']:
+        visualization_type = 'tier_distribution'
+    elif chart_type in ['A4', 'delta']:
+        visualization_type = 'delta_comparison'
+    elif chart_type in ['A5', 'dual_axis']:
+        visualization_type = 'trend_with_comparison'
+    elif '30_60_90' in str(chart_type):
+        visualization_type = 'delinquency_comparison'
+        
     card = {
+        'visualization_type': visualization_type,  # Add visualization type
         'metric': metric,
         'chart_type': chart_type,
         'period_range': None,
+        'latest_period': None,
+        'previous_period': None,
+        'earliest_period': None,
         'latest_value': None,
         'earliest_value': None,
         'min_value': None,
         'max_value': None,
         'mean_value': None,
         'trend': None,
+        'trend_direction': None,
+        'trend_value': None,
         'volatility': None,
         'composition_base': composition_base,  # CRITICAL for A3
+        'view_metadata': {},
         'key_facts': []
     }
     
@@ -66,7 +86,15 @@ def build_data_card(df: pd.DataFrame,
     if period_col in df.columns:
         periods = df[period_col].dropna()
         if len(periods) > 0:
-            card['period_range'] = f"{periods.min()} to {periods.max()}"
+            sorted_periods = sorted(set(periods.tolist()))
+            earliest_period = sorted_periods[0]
+            latest_period = sorted_periods[-1]
+            previous_period = sorted_periods[-2] if len(sorted_periods) > 1 else None
+            card['period_range'] = f"{earliest_period} to {latest_period}"
+            card['earliest_period'] = str(earliest_period)
+            card['latest_period'] = str(latest_period)
+            if previous_period is not None:
+                card['previous_period'] = str(previous_period)
     
     # Extract metric statistics
     if metric in df.columns and period_col in df.columns:
@@ -104,14 +132,33 @@ def build_data_card(df: pd.DataFrame,
             
             # Calculate trend
             if len(series) > 1:
+                latest_val = series.iloc[-1]
+                earliest_val = series.iloc[0]
+                absolute_change = latest_val - earliest_val if pd.notna(latest_val) and pd.notna(earliest_val) else None
                 if is_rate:
-                    change = (series.iloc[-1] - series.iloc[0]) * (100.0 if abs(series.iloc[0]) <= 1 else 1.0)
-                    card['trend'] = f"{change:+.1f} bps" if abs(change) < 1 else f"{change:+.1f} pp"
+                    change = (latest_val - earliest_val)
+                    scale_factor = 100.0 if abs(earliest_val) <= 1 else 1.0
+                    scaled_change = change * scale_factor if change is not None else None
+                    if scaled_change is not None:
+                        card['trend'] = (
+                            f"{scaled_change:+.1f} bps" if abs(scaled_change) < 1 else f"{scaled_change:+.1f} pp"
+                        )
+                    card['trend_value'] = scaled_change
                 else:
-                    base = series.iloc[0]
-                    change = ((series.iloc[-1] / base) - 1) * 100 if base else None
-                    card['trend'] = f"{change:+.1f}%" if change is not None and not pd.isna(change) else None
-                card['trend_value'] = change  # raw value
+                    base = earliest_val
+                    change_pct = ((latest_val / base) - 1) * 100 if base else None
+                    card['trend'] = (
+                        f"{change_pct:+.1f}%" if change_pct is not None and not pd.isna(change_pct) else None
+                    )
+                    card['trend_value'] = change_pct
+
+                if absolute_change is not None:
+                    if abs(absolute_change) < 1e-9:
+                        card['trend_direction'] = 'flat'
+                    elif absolute_change > 0:
+                        card['trend_direction'] = 'increase'
+                    else:
+                        card['trend_direction'] = 'decrease'
             
             # Calculate volatility (coefficient of variation)
             if series.std() > 0 and series.mean() > 0:
@@ -128,30 +175,116 @@ def build_data_card(df: pd.DataFrame,
         card['key_facts'].append(f"Composition based on {composition_base}")
     
     if chart_type == 'A4':
-        # Look for delta columns
-        delta_cols = [c for c in df.columns if metric in c and any(d in c for d in ['_yoy_pct', '_qoq_pct', '_mom_pct'])]
+        delta_snapshot = {}
+        delta_cols = [
+            c for c in df.columns
+            if metric in c and any(d in c for d in ['_yoy_pct', '_yoy_pp', '_qoq_pct', '_qoq_pp', '_mom_pct', '_mom_pp'])
+        ]
         if delta_cols:
-            latest_delta = df[delta_cols[0]].iloc[-1]
-            if pd.notna(latest_delta):
-                card['key_facts'].append(f"Latest change: {fmt_delta(latest_delta)}")
+            latest_idx = df[period_col].dropna().index[-1] if period_col in df.columns and not df[period_col].dropna().empty else -1
+            for col in delta_cols:
+                latest_delta = df[col].iloc[latest_idx] if latest_idx >= 0 else df[col].iloc[-1]
+                if pd.notna(latest_delta):
+                    suffix = col.replace(metric + '_', '')
+                    delta_snapshot[suffix] = float(latest_delta)
+            if delta_snapshot:
+                card['view_metadata']['deltas'] = delta_snapshot
+                # Prefer YoY/QoQ for headline fact ordering
+                for key in sorted(delta_snapshot.keys(), key=lambda x: (0 if 'yoy' in x else 1 if 'qoq' in x else 2, x)):
+                    card['key_facts'].append(f"Latest change ({key}): {fmt_delta(delta_snapshot[key])}")
     
     # Add tier information if present
     from synthesis_agent.io_normalize import extract_tier_columns
     tier_cols = extract_tier_columns(df)
+    tier_snapshot = {}
+
     if tier_cols:
-        # Get latest tier distribution (use last valid row to avoid dtype issues)
+        # Wide format with tier columns already present
         latest_idx = df[period_col].dropna().index[-1] if period_col in df.columns and not df[period_col].dropna().empty else -1
-        tier_values = {}
         for tier in tier_cols:
             if tier in df.columns:
                 value = df.loc[latest_idx, tier] if latest_idx >= 0 else df[tier].iloc[-1]
                 if pd.notna(value):
-                    tier_values[tier] = value
+                    tier_snapshot[tier] = float(value)
+    else:
+        # Long format – look for explicit tier column and aggregate latest period
+        for candidate in ('score_curr_tier', 'score_tier', 'score_band', 'tier'):
+            if candidate in df.columns:
+                if period_col in df.columns and card.get('latest_period'):
+                    latest_rows = df[df[period_col].astype(str) == str(card['latest_period'])]
+                else:
+                    latest_rows = df
+                if metric in df.columns:
+                    grouped = latest_rows.groupby(candidate)[metric].sum(min_count=1)
+                    tier_snapshot = {
+                        str(k).upper(): float(v)
+                        for k, v in grouped.dropna().items()
+                    }
+                break
+
+    if tier_snapshot:
+        prev_snapshot = {}
+        previous_period = card.get('previous_period')
+        if previous_period:
+            if tier_cols:
+                prev_row = df[df[period_col].astype(str) == str(previous_period)] if period_col in df.columns else pd.DataFrame()
+                if not prev_row.empty:
+                    for tier in tier_cols:
+                        if tier in prev_row.columns and pd.notna(prev_row.iloc[0][tier]):
+                            prev_snapshot[tier] = float(prev_row.iloc[0][tier])
+            else:
+                for candidate in ('score_curr_tier', 'score_tier', 'score_band', 'tier'):
+                    if candidate in df.columns and metric in df.columns:
+                        prev_rows = df[df[period_col].astype(str) == str(previous_period)] if period_col in df.columns else df
+                        grouped_prev = prev_rows.groupby(candidate)[metric].sum(min_count=1)
+                        prev_snapshot = {
+                            str(k).upper(): float(v)
+                            for k, v in grouped_prev.dropna().items()
+                        }
+                        break
+
+        sorted_tiers = sorted(tier_snapshot.items(), key=lambda kv: kv[1], reverse=True)
+        dominant_tier = sorted_tiers[0][0]
+        dominant_value = sorted_tiers[0][1]
+
+        tier_changes = []
+        tier_shifts = {}
+        tier_rankings = {}
         
-        if tier_values:
-            # Find dominant tier
-            dominant_tier = max(tier_values, key=tier_values.get)
-            card['key_facts'].append(f"Dominant tier: {dominant_tier} ({tier_values[dominant_tier]:.1f})")
+        # Create tier analysis dictionary for tier distribution charts
+        tier_analysis = {
+            'tier_shares': tier_snapshot,
+            'dominant_tier': dominant_tier,
+            'dominant_tier_value': dominant_value,
+            'tier_order': [t[0] for t in sorted_tiers]
+        }
+        
+        if prev_snapshot:
+            for tier, latest_val in tier_snapshot.items():
+                prev_val = prev_snapshot.get(tier)
+                if prev_val is not None:
+                    tier_changes.append((tier, latest_val - prev_val))
+
+        card['view_metadata']['tiers'] = {
+            'latest': sorted_tiers,
+            'previous': sorted(prev_snapshot.items(), key=lambda kv: kv[1], reverse=True) if prev_snapshot else None,
+            'changes': tier_changes if tier_changes else None,
+            'dominant': dominant_tier
+        }
+
+        card['key_facts'].append(f"Dominant tier: {dominant_tier} ({dominant_value:.1f})")
+        
+        # Add tier analysis to card for tier distribution charts
+        if card.get('visualization_type') == 'tier_distribution':
+            card['tier_analysis'] = tier_analysis
+            
+            # Add tier shifts if available
+            if tier_shifts:
+                card['tier_analysis']['tier_shifts'] = tier_shifts
+                
+            # Add tier rankings if available
+            if tier_rankings:
+                card['tier_analysis']['tier_rankings'] = tier_rankings
     
     logger.info(f"Built data card for {metric}/{chart_type} with {len(card['key_facts'])} facts")
     return card
@@ -161,7 +294,7 @@ def llm_narrate(data_card: Dict[str, Any],
                config: SynthesisConfig,
                narrative_type: str = 'insight') -> Dict[str, str]:
     """
-    Generate LLM narrative with strict limits.
+    Generate LLM narrative with strict limits based on chart type.
     CRITICAL: Enforce character/bullet limits and re-prompt on violation.
     
     Args:
@@ -189,24 +322,36 @@ def llm_narrate(data_card: Dict[str, Any],
     else:
         prompt = _build_notes_prompt(data_card, config)
     
+    # Determine visualization type for this narrative
+    viz_type = data_card.get('visualization_type', 'generic')
+    
     # Call LLM (Gemini Flash via Vertex AI)
+    llm_used = True
     try:
         narrative = _call_llm(prompt, config)
-            # Preserve separate insight title and numeric headline if provided
+        # Include visualization type in the narrative metadata
+        if isinstance(narrative, dict):
+            narrative['viz_type'] = viz_type
+            
         if isinstance(narrative, dict) and "title" in narrative and "headline" in narrative:
             narrative["insight_title"] = narrative["title"]
             narrative["metric_headline"] = narrative["headline"]
     except Exception as e:
-        logger.error(f"LLM call failed: {e}")
-        # If Vertex is selected, it must work (no silent fallback)
-        raise RuntimeError(f"Vertex AI narrative generation failed: {e}")
-    
+        llm_used = False
+        logger.warning(
+            "Falling back to deterministic narrative for %s/%s due to %s",
+            data_card.get('metric'),
+            data_card.get('chart_type'),
+            e,
+        )
+        narrative = stub_llm_narrative(data_card, config, narrative_type)
+
     # Validate and enforce limits (including numeric guard)
     validated = _validate_narrative(narrative, config, data_card)
     
-    # Re-prompt if validation failed
+    # Re-prompt if validation failed (only when LLM path succeeded)
     retry_count = 0
-    while not validated['is_valid'] and retry_count < config.runtime.max_retries:
+    while llm_used and not validated['is_valid'] and retry_count < config.runtime.max_retries:
         logger.warning(f"Narrative validation failed: {validated['issues']}")
         
         # Add correction instructions to prompt
@@ -326,9 +471,20 @@ def generate_speaker_notes(data_card: Dict[str, Any],
 # Helper functions
 
 def _build_insight_prompt(data_card: Dict[str, Any], config: SynthesisConfig) -> str:
-    """Build prompt for insight narrative."""
+    """Build prompt for insight narrative based on chart type."""
     limits = NARRATIVE_LIMITS
     
+    # Check visualization type to route to specialized prompt builder
+    viz_type = data_card.get('visualization_type', 'generic')
+    
+    if viz_type == 'tier_distribution':
+        return _build_tier_insight_prompt(data_card, config)
+    elif viz_type == 'trend':
+        return _build_trend_insight_prompt(data_card, config)
+    elif viz_type == 'delta_comparison':
+        return _build_delta_insight_prompt(data_card, config)
+    
+    # Default generic prompt if no specific visualization type
     # Use formatted values if available, fallback to raw
     latest_value = data_card.get('latest_value_formatted', data_card.get('latest_value', 'N/A'))
     earliest_value = data_card.get('earliest_value_formatted', data_card.get('earliest_value', 'N/A'))
@@ -381,8 +537,137 @@ FORMAT:
     return prompt
 
 
+def _build_tier_insight_prompt(data_card: Dict[str, Any], config: SynthesisConfig) -> str:
+    """Build specialized prompt for tier distribution chart insights."""
+    limits = NARRATIVE_LIMITS
+    metric_name = pretty_label(data_card.get('metric', 'metric'))
+    
+    # Extract tier-specific data if available
+    tier_analysis = data_card.get('tier_analysis', {})
+    dominant_tier = tier_analysis.get('dominant_tier', 'Unknown')
+    tier_shares = tier_analysis.get('tier_shares', {})
+    
+    prompt = f"""
+    Generate an executive insight about the credit tier distribution for {metric_name} with the following constraints:
+
+    STRICT REQUIREMENTS:
+    - Focus primarily on the credit tier composition and what it reveals about risk distribution
+    - Highlight the dominant tier ({dominant_tier}) and its significance
+    - Compare the performance across different credit tiers
+    - Note any significant shifts between tiers or concentration of risk
+    - Keep the title under {limits['title_max_chars']} characters
+    - Include 2-4 bullet points, each under {limits['bullet_max_chars']} characters
+    - Keep the strapline under {limits['strapline_max_chars']} characters
+    - Avoid using jargon or overly technical language
+    - Focus on tier composition insights relevant to risk and portfolio managers
+    - Be specific about tier performance rather than generic observations
+    
+    DATA FACTS:
+    {data_card['key_facts']}
+    
+    OUTPUT FORMAT:
+    {{
+        "title": "Credit Tier Distribution Insight - Brief, specific, and clear",
+        "strapline": "One-sentence summary that highlights the most important tier-related insight",
+        "bullets": [
+            "Key insight about dominant tier and its implications",
+            "Notable observation about tier distribution and risk",
+            "Insight about significant changes in tier composition"
+        ]
+    }}
+    """
+    
+    return prompt
+
+
+def _build_trend_insight_prompt(data_card: Dict[str, Any], config: SynthesisConfig) -> str:
+    """Build specialized prompt for trend chart insights."""
+    limits = NARRATIVE_LIMITS
+    metric_name = pretty_label(data_card.get('metric', 'metric'))
+    
+    # Extract trend-specific data
+    latest_value = data_card.get('latest_value_formatted', data_card.get('latest_value', 'N/A'))
+    earliest_value = data_card.get('earliest_value_formatted', data_card.get('earliest_value', 'N/A'))
+    change_pct = data_card.get('change_pct_formatted', data_card.get('change_pct', 'N/A'))
+    
+    prompt = f"""
+    Generate an executive insight about the trend for {metric_name} with the following constraints:
+
+    STRICT REQUIREMENTS:
+    - Focus primarily on the time-based trend and pattern over the period
+    - Highlight key turning points, acceleration, or deceleration in the trend
+    - Note any seasonality or cyclical patterns if evident
+    - Compare the latest value ({latest_value}) with the earliest value ({earliest_value})
+    - Mention the overall change ({change_pct}) and its significance
+    - Keep the title under {limits['title_max_chars']} characters
+    - Include 2-4 bullet points, each under {limits['bullet_max_chars']} characters
+    - Keep the strapline under {limits['strapline_max_chars']} characters
+    - Avoid using jargon or overly technical language
+    - Focus on trend insights relevant to business decisions
+    
+    DATA FACTS:
+    {data_card['key_facts']}
+    
+    OUTPUT FORMAT:
+    {{
+        "title": "Trend Analysis Insight - Brief, specific, and clear",
+        "strapline": "One-sentence summary that captures the most important trend",
+        "bullets": [
+            "Key insight about the overall trend direction and magnitude",
+            "Notable observation about pattern changes or inflection points",
+            "Business implication of the observed trend"
+        ]
+    }}
+    """
+    
+    return prompt
+
+
+def _build_delta_insight_prompt(data_card: Dict[str, Any], config: SynthesisConfig) -> str:
+    """Build specialized prompt for delta comparison chart insights."""
+    limits = NARRATIVE_LIMITS
+    metric_name = pretty_label(data_card.get('metric', 'metric'))
+    
+    # Extract delta-specific information
+    delta_type = data_card.get('delta_type', 'YOY').upper()
+    delta_value = data_card.get('delta_formatted', data_card.get('delta', 'N/A'))
+    
+    prompt = f"""
+    Generate an executive insight about the {delta_type} change in {metric_name} with the following constraints:
+
+    STRICT REQUIREMENTS:
+    - Focus primarily on the period-over-period comparison and what it reveals
+    - Highlight the magnitude and direction of change ({delta_value})
+    - Compare this change to historical patterns or expectations
+    - Note any significant acceleration or deceleration in the rate of change
+    - Keep the title under {limits['title_max_chars']} characters
+    - Include 2-4 bullet points, each under {limits['bullet_max_chars']} characters
+    - Keep the strapline under {limits['strapline_max_chars']} characters
+    - Avoid using jargon or overly technical language
+    - Focus on comparative insights relevant to business decisions
+    - Be specific about what the delta reveals rather than just stating the change
+    
+    DATA FACTS:
+    {data_card['key_facts']}
+    
+    OUTPUT FORMAT:
+    {{
+        "title": "{delta_type} Comparison Insight - Brief, specific, and clear",
+        "strapline": "One-sentence summary that captures the most important comparative finding",
+        "bullets": [
+            "Key insight about the magnitude and direction of change",
+            "Notable observation about what this change reveals",
+            "Business implication of the observed change"
+        ]
+    }}
+    """
+    
+    return prompt
+
+
 def _build_summary_prompt(data_card: Dict[str, Any], config: SynthesisConfig) -> str:
     """Build prompt for summary narrative."""
+
     return f"""
 Summarize the key findings for {data_card['metric']}:
 
@@ -466,33 +751,9 @@ def _call_llm(prompt: str, config: SynthesisConfig) -> Dict[str, str]:
         
         return result
         
-    except ImportError:
-        # Vertex AI SDK not available - use fallback implementation
-        logger.warning("Vertex AI SDK not available, using deterministic fallback")
-        
-        # Parse key information from prompt to generate contextual response
-        import re
-        
-        # Extract metric name from prompt
-        metric_match = re.search(r'for (\w+)', prompt)
-        metric = metric_match.group(1) if metric_match else "metric"
-        
-        # Extract trend if present
-        trend_match = re.search(r'Trend: ([^\\n]+)', prompt)
-        trend = trend_match.group(1) if trend_match else "stable"
-        
-        # Generate contextual response based on extracted info
-        metric_display = metric.replace('_', ' ').title()
-        
-        return {
-            "title": f"{metric_display} Performance Overview",
-            "bullets": [
-                f"{metric_display} analysis reveals {trend} pattern",
-                "Key drivers align with portfolio objectives",
-                "Continued monitoring recommended for optimization"
-            ],
-            "strapline": f"{metric_display} demonstrates expected behavior within portfolio context"
-        }
+    except ImportError as exc:
+        logger.warning("Vertex AI SDK not available: %s", exc)
+        raise RuntimeError("vertex_sdk_unavailable") from exc
         
     except Exception as e:
         logger.error(f"LLM call failed: {e}")
@@ -610,51 +871,263 @@ def _verify_numbers_against_data_card(numbers: List[str], data_card: Dict[str, A
     return violations
 
 
-def stub_llm_narrative(data_card: Dict[str, Any], config: SynthesisConfig, 
+def stub_llm_narrative(data_card: Dict[str, Any], config: SynthesisConfig,
                       narrative_type: str = 'insight') -> Dict[str, str]:
-    """
-    Stub LLM narrative for testing or when Vertex AI is unavailable.
-    
-    Args:
-        data_card: Data card with facts
-        config: Synthesis configuration
-        narrative_type: Type of narrative
-    
-    Returns:
-        Stub narrative dictionary
-    """
-    metric = data_card.get('metric', 'Data')
-    chart_type = data_card.get('chart_type', '')
-    
-    # Generate deterministic narrative based on data
-    title = f"Analysis of {metric.replace('_', ' ').title()}"
-    
-    bullets = []
-    if data_card.get('latest_value') is not None and data_card.get('earliest_value') is not None:
-        bullets.append(f"Current value: {data_card['latest_value']}, initial: {data_card['earliest_value']}")
-    
-    if data_card.get('trend_direction'):
-        bullets.append(f"Trend shows {data_card['trend_direction']} movement")
-    
-    if data_card.get('delta_values'):
-        for delta_type, value in data_card['delta_values'].items():
-            if value is not None:
-                bullets.append(f"{delta_type}: {value}")
-    
-    # Ensure at least 2 bullets
-    while len(bullets) < 2:
-        bullets.append(f"Pattern detected in {metric.replace('_', ' ')} data")
-    
-    # Cap at 3 bullets
-    bullets = bullets[:3]
-    
-    strapline = f"Key insight: {metric.replace('_', ' ')} shows measurable change over the period"
-    
-    return {
-        'title': title[:NARRATIVE_LIMITS['title_max_chars']],
-        'bullets': bullets,
-        'strapline': strapline[:NARRATIVE_LIMITS['strapline_max_chars']]
+    """Deterministic narrative that mirrors LLM output when Vertex AI is unavailable."""
+
+    if narrative_type != 'insight':
+        # Preserve legacy behaviour for summaries/notes
+        metric_name = pretty_label(data_card.get('metric', 'Metric'))
+        period = data_card.get('period_range') or 'latest period'
+        return {
+            'title': f"{metric_name} Overview"[:NARRATIVE_LIMITS['title_max_chars']],
+            'bullets': [f"Coverage spans {period}", "Deterministic narrative mode", "Refer to charts for detail"][:3],
+            'strapline': f"{metric_name} insight generated offline"[:NARRATIVE_LIMITS['strapline_max_chars']]
+        }
+
+    return _deterministic_insight(data_card)
+
+
+def _deterministic_insight(data_card: Dict[str, Any]) -> Dict[str, str]:
+    chart_type = (data_card.get('chart_type') or '').upper()
+    if chart_type == 'A3':
+        return _build_tier_insight(data_card)
+    if chart_type == 'A4':
+        return _build_delta_insight(data_card)
+    return _build_trend_insight(data_card)
+
+
+def _build_trend_insight(data_card: Dict[str, Any]) -> Dict[str, str]:
+    metric_name = pretty_label(data_card.get('metric', 'Metric'))
+    latest_period = _humanize_period(data_card.get('latest_period'))
+    period_range = data_card.get('period_range')
+    direction = data_card.get('trend_direction') or 'flat'
+    direction_map = {
+        'increase': 'rises',
+        'decrease': 'declines',
+        'flat': 'holds steady'
     }
+    verb = direction_map.get(direction, 'trend update')
+
+    if latest_period and verb != 'trend update':
+        title = f"{metric_name} {verb} into {latest_period}"
+    elif latest_period:
+        title = f"{metric_name} trend update for {latest_period}"
+    else:
+        title = f"{metric_name} performance update"
+
+    latest_value = data_card.get('latest_value_formatted') or _format_numeric(data_card.get('latest_value'), data_card.get('metric'))
+    earliest_period = _humanize_period(data_card.get('earliest_period'))
+    earliest_value = data_card.get('earliest_value_formatted') or _format_numeric(data_card.get('earliest_value'), data_card.get('metric'))
+    trend_text = data_card.get('trend')
+    bullets = []
+
+    if latest_period and latest_value:
+        bullets.append(f"{latest_period}: {latest_value}")
+    if trend_text:
+        bullets.append(f"Change vs start: {trend_text}")
+    elif direction != 'flat':
+        bullets.append(f"Direction: {direction.title()}")
+    if earliest_period and earliest_value and earliest_period != latest_period:
+        bullets.append(f"{earliest_period}: {earliest_value}")
+
+    bullets = _finalize_bullets(bullets, data_card)
+
+    strapline_direction = {
+        'increase': 'uptrend',
+        'decrease': 'downtrend',
+        'flat': 'stable trend'
+    }.get(direction, 'trend')
+    strapline = f"{metric_name} {strapline_direction}"
+    strapline_period = latest_period or (period_range.split(' to ')[-1] if period_range else '')
+    if strapline_period:
+        strapline += f" through {strapline_period}"
+
+    return {
+        'title': _limit_title(title),
+        'bullets': bullets,
+        'strapline': _limit_strapline(strapline)
+    }
+
+
+def _build_tier_insight(data_card: Dict[str, Any]) -> Dict[str, str]:
+    metric_name = pretty_label(data_card.get('metric', 'Metric'))
+    latest_period = _humanize_period(data_card.get('latest_period'))
+    previous_period = _humanize_period(data_card.get('previous_period'))
+    tier_meta = (data_card.get('view_metadata') or {}).get('tiers') or {}
+    latest_tiers = tier_meta.get('latest') or []
+    if not latest_tiers:
+        return _build_trend_insight(data_card)
+
+    top_tier, top_value = latest_tiers[0]
+    top_name = _format_tier_name(top_tier)
+    title = f"{metric_name} mix led by {top_name}"
+
+    changes = {tier: change for tier, change in (tier_meta.get('changes') or [])}
+    second_line = None
+    if len(latest_tiers) > 1:
+        second_tier, second_val = latest_tiers[1]
+        second_line = f"{_format_tier_name(second_tier)}: {_format_share(second_val)}"
+
+    bullets = []
+    share_text = _format_share(top_value)
+    if latest_period:
+        bullets.append(f"{top_name}: {share_text} in {latest_period}")
+    else:
+        bullets.append(f"{top_name}: {share_text}")
+
+    change_val = changes.get(top_tier)
+    if change_val is not None and abs(change_val) >= 1e-4 and previous_period:
+        direction_word = 'gains' if change_val > 0 else 'loses'
+        bullets.append(f"{top_name} {direction_word} {fmt_delta(change_val)} vs {previous_period}")
+    elif previous_period:
+        bullets.append(f"{top_name} steady vs {previous_period}")
+
+    if second_line:
+        bullets.append(second_line)
+
+    bullets = _finalize_bullets(bullets, data_card)
+
+    strapline = f"{metric_name} mix highlights {top_name} leadership"
+    strapline_period = latest_period or data_card.get('period_range')
+    if strapline_period:
+        strapline += f" in {strapline_period}"
+
+    return {
+        'title': _limit_title(title),
+        'bullets': bullets,
+        'strapline': _limit_strapline(strapline)
+    }
+
+
+def _build_delta_insight(data_card: Dict[str, Any]) -> Dict[str, str]:
+    metric_name = pretty_label(data_card.get('metric', 'Metric'))
+    latest_period = _humanize_period(data_card.get('latest_period'))
+    deltas = (data_card.get('view_metadata') or {}).get('deltas') or {}
+    if not deltas:
+        return _build_trend_insight(data_card)
+
+    preferred_order = ['yoy', 'qoq', 'mom']
+    selected_key = None
+    for basis in preferred_order:
+        for key in deltas.keys():
+            if basis in key.lower():
+                selected_key = key
+                break
+        if selected_key:
+            break
+    if selected_key is None:
+        selected_key = next(iter(deltas))
+
+    delta_value = deltas[selected_key]
+    basis_label = selected_key.upper().replace('_PCT', '').replace('_PP', '')
+    basis_clean = basis_label.replace('YOY', 'YoY').replace('QOQ', 'QoQ').replace('MOM', 'MoM')
+    delta_text = fmt_delta(delta_value)
+    title = f"{metric_name} {basis_clean} change {delta_text}"
+
+    latest_value = data_card.get('latest_value_formatted') or _format_numeric(data_card.get('latest_value'), data_card.get('metric'))
+    previous_period = _humanize_period(data_card.get('previous_period'))
+    trend_text = data_card.get('trend')
+
+    bullets = []
+    if latest_period and latest_value:
+        bullets.append(f"{latest_period}: {latest_value}")
+    bullets.append(f"{basis_clean} change: {delta_text}")
+    if trend_text:
+        bullets.append(f"Trend vs start: {trend_text}")
+    elif previous_period and latest_value:
+        bullets.append(f"Compared with {previous_period}")
+
+    bullets = _finalize_bullets(bullets, data_card)
+
+    direction = 'improves' if delta_value and delta_value > 0 else 'softens' if delta_value and delta_value < 0 else 'holds'
+    strapline = f"{basis_clean} view {direction}"
+    if metric_name:
+        strapline += f" for {metric_name}"
+
+    return {
+        'title': _limit_title(title),
+        'bullets': bullets,
+        'strapline': _limit_strapline(strapline)
+    }
+
+
+def _humanize_period(period: Optional[Any]) -> Optional[str]:
+    if period in (None, '', pd.NA):
+        return None
+    text = str(period)
+    try:
+        if 'Q' in text.upper():
+            per = pd.Period(text.upper(), freq='Q')
+            return f"Q{per.quarter} {per.year}"
+        if '-' in text:
+            per = pd.Period(text, freq='M')
+            return per.strftime('%b %Y')
+    except Exception:
+        pass
+    return text
+
+
+def _format_share(value: Optional[float]) -> str:
+    if value is None or pd.isna(value):
+        return 'N/A'
+    return fmt_percent(float(value), decimals=1)
+
+
+def _format_tier_name(name: Optional[str]) -> str:
+    if not name:
+        return 'Tier'
+    return str(name).replace('_', ' ').title()
+
+
+def _format_numeric(value: Optional[float], metric: Optional[str]) -> Optional[str]:
+    if value is None or pd.isna(value):
+        return None
+    metric_lower = (metric or '').lower()
+    if any(tok in metric_lower for tok in ('bal', 'amt', 'amount', 'dollar')):
+        return fmt_currency(value)
+    if any(tok in metric_lower for tok in ('rate', 'pct', 'percent')):
+        return fmt_percent(value, decimals=1)
+    return f"{value:,.1f}"
+
+
+def _clean_bullet(text: str) -> str:
+    cleaned = text.strip()
+    if cleaned.endswith('.'):
+        cleaned = cleaned[:-1]
+    return cleaned
+
+
+def _finalize_bullets(bullets: List[str], data_card: Dict[str, Any]) -> List[str]:
+    cleaned: List[str] = []
+    for bullet in bullets:
+        if not bullet:
+            continue
+        text = _clean_bullet(bullet)
+        if text and text not in cleaned:
+            cleaned.append(text)
+
+    if data_card.get('period_range') and len(cleaned) < 2:
+        cleaned.append(f"Range: {data_card['period_range']}")
+    while len(cleaned) < 2:
+        cleaned.append("Monitoring continues")
+
+    return cleaned[:3]
+
+
+def _limit_title(title: str) -> str:
+    title = title.strip()
+    if len(title) <= NARRATIVE_LIMITS['title_max_chars']:
+        return title
+    return title[:NARRATIVE_LIMITS['title_max_chars']].rstrip()
+
+
+def _limit_strapline(text: str) -> str:
+    text = text.strip()
+    max_len = NARRATIVE_LIMITS['strapline_max_chars']
+    if len(text) <= max_len:
+        return text
+    return text[:max_len].rstrip()
 
 
 def _generate_fallback_narrative(data_card: Dict[str, Any], narrative_type: str) -> Dict[str, str]:
@@ -713,26 +1186,6 @@ def _validate_narrative(narrative: Dict[str, str], config: SynthesisConfig,
         'is_valid': len(issues) == 0,
         'issues': issues
     }
-
-
-def _generate_fallback_narrative(data_card: Dict[str, Any], narrative_type: str) -> Dict[str, str]:
-    """Generate safe fallback narrative."""
-    metric_name = data_card['metric'].replace('_', ' ').title()
-    
-    if narrative_type == 'insight':
-        return {
-            "title": f"{metric_name} Analysis",
-            "bullets": [
-                f"Data covers period {data_card['period_range']}",
-                f"Latest value: {data_card['latest_value']}",
-                f"Overall trend: {data_card['trend'] or 'Stable'}"
-            ],
-            "strapline": f"{metric_name} shows expected patterns over the analysis period"
-        }
-    else:
-        return {
-            "summary": f"{metric_name} analysis for {data_card['period_range']}"
-        }
 
 
 def _reorder_narratives(narratives: List[Dict[str, str]]) -> List[Dict[str, str]]:
