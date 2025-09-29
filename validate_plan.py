@@ -42,6 +42,7 @@ class CoverageEntry:
     topic: str
     group: str
     metric: str
+    chart_type: Optional[str] = None  # Specific chart type
     has_trend: bool = False
     has_delta: bool = False
     has_composition: bool = False
@@ -49,16 +50,21 @@ class CoverageEntry:
     slide_count: int = 0
     fallback_used: bool = False
     skip_reason: Optional[str] = None
+    # Track chart-specific narrative status
+    has_tier_narrative: bool = False  # Whether tier-specific narrative is present
+    has_trend_narrative: bool = False  # Whether trend-specific narrative is present
+    has_delta_narrative: bool = False  # Whether delta-specific narrative is present
 
 
 class CoverageLedger:
     """
     Track coverage of metrics across topics.
     Ensures ≥1 slide per metric or logs reason.
+    Tracks coverage by chart type to ensure appropriate narrative for each visualization.
     """
     
     def __init__(self, requested_metrics: Optional[Dict] = None):
-        self.entries: Dict[Tuple[str, str, str], CoverageEntry] = {}
+        self.entries: Dict[Tuple[str, str, str, Optional[str]], CoverageEntry] = {}
         self.warnings: List[str] = []
         self.requested_metrics = requested_metrics or {}
         
@@ -69,31 +75,58 @@ class CoverageLedger:
                     for metric in metrics:
                         self.add_entry(topic, group, metric)
     
-    def add_entry(self, topic: str, group: str, metric: str) -> CoverageEntry:
-        """Add or get coverage entry."""
-        key = (topic, group, metric)
+    def add_entry(self, topic: str, group: str, metric: str, chart_type: Optional[str] = None) -> CoverageEntry:
+        """Add or get coverage entry with optional chart type."""
+        key = (topic, group, metric, chart_type)
         if key not in self.entries:
-            self.entries[key] = CoverageEntry(topic, group, metric)
+            self.entries[key] = CoverageEntry(topic, group, metric, chart_type)
         return self.entries[key]
     
     def mark_coverage(self, topic: str, group: str, metric: str,
-                      chart_type: str, fallback: bool = False):
-        """Mark that a metric has coverage."""
-        entry = self.add_entry(topic, group, metric)
-        entry.slide_count += 1
+                      chart_type: str, fallback: bool = False, 
+                      narrative_type: Optional[str] = None):
+        """
+        Mark that a metric has coverage with specific chart and narrative type.
+        
+        Args:
+            topic: Topic name
+            group: Insight group
+            metric: Metric name
+            chart_type: Chart type (A2, A3, A4, A5)
+            fallback: Whether fallback was used
+            narrative_type: Type of narrative (tier, trend, delta)
+        """
+        # Mark in general entry without chart type
+        general_entry = self.add_entry(topic, group, metric)
+        general_entry.slide_count += 1
+        
+        # Also mark in chart-specific entry
+        specific_entry = self.add_entry(topic, group, metric, chart_type)
+        specific_entry.slide_count += 1
         
         if fallback:
-            entry.fallback_used = True
+            general_entry.fallback_used = True
+            specific_entry.fallback_used = True
         
         # Update flags based on chart type
         if chart_type in ['A2', 'A5', 'trend', 'dual_axis', 'dual-axis']:
-            entry.has_trend = True
+            general_entry.has_trend = True
+            specific_entry.has_trend = True
+            if narrative_type == 'trend':
+                specific_entry.has_trend_narrative = True
         elif chart_type in ['A3', 'composition']:
-            entry.has_composition = True
+            general_entry.has_composition = True
+            specific_entry.has_composition = True
+            if narrative_type == 'tier':
+                specific_entry.has_tier_narrative = True
         elif chart_type in ['A4', 'delta']:
-            entry.has_delta = True
+            general_entry.has_delta = True
+            specific_entry.has_delta = True
+            if narrative_type == 'delta':
+                specific_entry.has_delta_narrative = True
         elif chart_type == '30_60_90':
-            entry.has_30_60_90 = True
+            general_entry.has_30_60_90 = True
+            specific_entry.has_30_60_90 = True
     
     def get_missing(self) -> List[CoverageEntry]:
         """Get entries with no coverage."""
