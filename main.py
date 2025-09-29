@@ -126,33 +126,89 @@ def _descriptive_chart_title(
     short_delta: Optional[str] = None,
     focus_label: Optional[str] = None,
 ) -> str:
-    base = pretty_label(metric)
-    suffix = "Performance overview"
+    """Generate descriptive chart titles based on chart type.
+    
+    Creates distinct titles for trend charts, tier distribution charts, and delta charts.
+    
+    Args:
+        metric: Metric name
+        chart_type: Chart type (A2, A3, A4, etc.)
+        short_delta: Delta type abbreviation (qoq, yoy, mom)
+        focus_label: Period label for focus (e.g., Q4 2024)
+        
+    Returns:
+        Descriptive chart title
+    """
     if chart_type == 'A2':
+        return _trend_chart_title(metric, focus_label)
+    elif chart_type == 'A3':
+        return _tier_chart_title(metric, short_delta, focus_label)
+    elif chart_type == 'A4':
+        return _delta_chart_title(metric, short_delta)
+    elif chart_type == 'A5':
+        return _comparison_chart_title(metric)
+        
+    # Fallback to generic title
+    base = pretty_label(metric)
+    return f"{base} — Performance overview"
+
+
+def _trend_chart_title(metric: str, focus_label: Optional[str] = None) -> str:
+    """Generate title for trend charts (A2)."""
+    base = pretty_label(metric)
+    focus_words = _quarter_label_to_words(focus_label)
+    
+    if focus_words:
+        suffix = f"{focus_words} trend across years"
+    else:
+        suffix = "Trend over time"
+        
+    return f"{base} — {suffix}"
+
+
+def _tier_chart_title(metric: str, short_delta: Optional[str], focus_label: Optional[str]) -> str:
+    """Generate title for tier distribution charts (A3)."""
+    base = pretty_label(metric)
+    
+    # Create different titles for tier charts based on delta type
+    if short_delta and short_delta.lower() == 'qoq':
+        return f"{base} — Quarter-over-Quarter Credit Tier Distribution"
+    elif short_delta and short_delta.lower() == 'yoy':
+        return f"{base} — Year-over-Year Credit Tier Composition"
+    elif short_delta and short_delta.lower() == 'mom':
+        return f"{base} — Month-over-Month Credit Tier Distribution"
+    
+    # Fallback based on focus period
+    if focus_label:
         focus_words = _quarter_label_to_words(focus_label)
         if focus_words:
-            suffix = f"{focus_words} trend across years"
-        else:
-            suffix = "Trend over time"
-    elif chart_type == 'A3':
-        suffix = "Credit tier mix"
-        if focus_label:
-            focus_words = _quarter_label_to_words(focus_label)
-            if focus_words:
-                suffix = f"{focus_words} tier mix across years"
-    elif chart_type == 'A4':
-        delta_map = {
-            'qoq': 'Quarter-over-quarter change',
-            'yoy': 'Year-over-year change',
-            'mom': 'Month-over-month change',
-        }
-        if short_delta:
-            suffix = delta_map.get(short_delta.lower(), 'Period-over-period change')
-        else:
-            suffix = 'Period-over-period change'
-    elif chart_type == 'A5':
-        suffix = 'Dual-axis comparison'
+            return f"{base} — {focus_words} Credit Tier Breakdown"
+    
+    return f"{base} — Credit Tier Distribution Analysis"
+
+
+def _delta_chart_title(metric: str, short_delta: Optional[str]) -> str:
+    """Generate title for delta comparison charts (A4)."""
+    base = pretty_label(metric)
+    
+    delta_map = {
+        'qoq': 'Quarter-over-Quarter Change Analysis',
+        'yoy': 'Year-over-Year Change Analysis',
+        'mom': 'Month-over-Month Change Analysis',
+    }
+    
+    if short_delta:
+        suffix = delta_map.get(short_delta.lower(), 'Period-over-Period Comparison')
+    else:
+        suffix = 'Comparative Change Analysis'
+        
     return f"{base} — {suffix}"
+
+
+def _comparison_chart_title(metric: str) -> str:
+    """Generate title for dual-axis comparison charts (A5)."""
+    base = pretty_label(metric)
+    return f"{base} — Multi-Dimensional Performance Analysis"
 
 
 
@@ -1889,8 +1945,19 @@ def process_topic(topic: str,
                                         logger.info(f"Added insight slide with image for {metric} (YOY)")
                                         ctx.topic_has_image[topic] = True
                                         chart_type_for_coverage = 'A2' if yoy_chart_type == 'A5' else yoy_chart_type
+                                        # Determine narrative type based on chart type
+                                        if chart_type_for_coverage == 'A3':
+                                            narrative_type = 'tier'
+                                        elif chart_type_for_coverage in ['A2', 'A5']:
+                                            narrative_type = 'trend'
+                                        elif chart_type_for_coverage == 'A4':
+                                            narrative_type = 'delta'
+                                        else:
+                                            narrative_type = None
+                                            
                                         coverage_ledger.mark_coverage(
-                                            topic, group_name, metric, chart_type_for_coverage
+                                            topic, group_name, metric, chart_type_for_coverage,
+                                            fallback=False, narrative_type=narrative_type
                                         )
                                         chart_types_generated.add(yoy_chart_type)
                                         results['slides_created'] += 1
