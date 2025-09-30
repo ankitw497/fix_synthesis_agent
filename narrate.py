@@ -14,7 +14,7 @@ from synthesis_agent.config import (
     NARRATIVE_LIMITS, SynthesisConfig
 )
 from synthesis_agent.utils import (
-    fmt_currency, fmt_percent, fmt_delta, setup_logging
+    fmt_currency, fmt_percent, fmt_delta, fmt_value, setup_logging
 )
 # Import metric-aware aggregation from charts module
 try:
@@ -225,10 +225,10 @@ def llm_narrate(data_card: Dict[str, Any],
         prompt = _build_summary_prompt(data_card, config)
     else:
         prompt = _build_notes_prompt(data_card, config)
-    
+
     # Call LLM (Gemini Flash via Vertex AI)
     try:
-        narrative = _call_llm(prompt, config)
+        narrative = _call_llm(prompt, config, data_card)
             # Preserve separate insight title and numeric headline if provided
         if isinstance(narrative, dict) and "title" in narrative and "headline" in narrative:
             narrative["insight_title"] = narrative["title"]
@@ -249,7 +249,7 @@ def llm_narrate(data_card: Dict[str, Any],
         # Add correction instructions to prompt
         correction_prompt = prompt + f"\n\nCORRECTION REQUIRED:\n" + "\n".join(validated['issues'])
         correction_prompt += "\n\nIMPORTANT: Only use numbers that appear in the data card facts provided."
-        narrative = _call_llm(correction_prompt, config)
+        narrative = _call_llm(correction_prompt, config, data_card)
         validated = _validate_narrative(narrative, config, data_card)
         retry_count += 1
     
@@ -485,7 +485,7 @@ def generate_narrative(data_card: Dict[str, Any], config: SynthesisConfig,
         return llm_func(data_card, config, narrative_type)
 
 
-def _call_llm(prompt: str, config: SynthesisConfig) -> Dict[str, str]:
+def _call_llm(prompt: str, config: SynthesisConfig, data_card: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
     """
     Call LLM (Gemini Flash) for narrative generation.
     """
@@ -524,32 +524,12 @@ def _call_llm(prompt: str, config: SynthesisConfig) -> Dict[str, str]:
         return result
         
     except ImportError:
-        # Vertex AI SDK not available - use fallback implementation
+        # Vertex AI SDK not available - use deterministic fallback
         logger.warning("Vertex AI SDK not available, using deterministic fallback")
-        
-        # Parse key information from prompt to generate contextual response
-        import re
-        
-        # Extract metric name from prompt
-        metric_match = re.search(r'for (\w+)', prompt)
-        metric = metric_match.group(1) if metric_match else "metric"
-        
-        # Extract trend if present
-        trend_match = re.search(r'Trend: ([^\\n]+)', prompt)
-        trend = trend_match.group(1) if trend_match else "stable"
-        
-        # Generate contextual response based on extracted info
-        metric_display = metric.replace('_', ' ').title()
-        
-        return {
-            "title": f"{metric_display} Performance Overview",
-            "bullets": [
-                f"{metric_display} analysis reveals {trend} pattern",
-                "Key drivers align with portfolio objectives",
-                "Continued monitoring recommended for optimization"
-            ],
-            "strapline": f"{metric_display} demonstrates expected behavior within portfolio context"
-        }
+
+        if data_card is None:
+            data_card = {}
+        return stub_llm_narrative(data_card, config)
         
     except Exception as e:
         logger.error(f"LLM call failed: {e}")
@@ -667,50 +647,159 @@ def _verify_numbers_against_data_card(numbers: List[str], data_card: Dict[str, A
     return violations
 
 
-def stub_llm_narrative(data_card: Dict[str, Any], config: SynthesisConfig, 
+def stub_llm_narrative(data_card: Dict[str, Any], config: SynthesisConfig,
                       narrative_type: str = 'insight') -> Dict[str, str]:
-    """
-    Stub LLM narrative for testing or when Vertex AI is unavailable.
-    
-    Args:
-        data_card: Data card with facts
-        config: Synthesis configuration
-        narrative_type: Type of narrative
-    
-    Returns:
-        Stub narrative dictionary
-    """
-    metric = data_card.get('metric', 'Data')
-    chart_type = data_card.get('chart_type', '')
-    
-    # Generate deterministic narrative based on data
-    title = f"Analysis of {metric.replace('_', ' ').title()}"
-    
-    bullets = []
-    if data_card.get('latest_value') is not None and data_card.get('earliest_value') is not None:
-        bullets.append(f"Current value: {data_card['latest_value']}, initial: {data_card['earliest_value']}")
-    
-    if data_card.get('trend_direction'):
-        bullets.append(f"Trend shows {data_card['trend_direction']} movement")
-    
-    if data_card.get('delta_values'):
-        for delta_type, value in data_card['delta_values'].items():
-            if value is not None:
-                bullets.append(f"{delta_type}: {value}")
-    
-    # Ensure at least 2 bullets
-    while len(bullets) < 2:
-        bullets.append(f"Pattern detected in {metric.replace('_', ' ')} data")
-    
-    # Cap at 3 bullets
-    bullets = bullets[:3]
-    
-    strapline = f"Key insight: {metric.replace('_', ' ')} shows measurable change over the period"
-    
+    """Create a view-aware deterministic narrative for offline environments."""
+
+    metric_raw = str(data_card.get('metric', 'Metric'))
+
+    def _humanize_metric(text: str) -> str:
+        tokens = [t for t in str(text).replace('_', ' ').split() if t]
+        if not tokens:
+            return "Metric"
+        return " ".join(word.capitalize() if not word.isupper() else word for word in tokens)
+
+    metric_display = _humanize_metric(metric_raw)
+    latest_fmt = data_card.get('latest_value_formatted') or data_card.get('latest_value')
+    earliest_fmt = data_card.get('earliest_value_formatted') or data_card.get('earliest_value')
+    trend_text = data_card.get('trend')
+    period_range = data_card.get('period_range') or "the period"
+
+    view = data_card.get('view') or {}
+    view_kind = (view.get('kind') or '').lower()
+    delta_window = (view.get('delta_type') or '').lower()
+    window_display = {
+        'qoq': 'QoQ',
+        'yoy': 'YoY',
+        'mom': 'MoM',
+    }.get(delta_window, delta_window.upper() if delta_window else 'QoQ')
+
+    def _movement_word(change_value: Optional[float]) -> str:
+        if change_value is None:
+            return "stabilized"
+        if change_value > 0:
+            return "climbed"
+        if change_value < 0:
+            return "softened"
+        return "held steady"
+
+    def _parse_tier_mix() -> Tuple[List[Tuple[str, str]], Optional[Tuple[str, str]]]:
+        top_entries: List[Tuple[str, str]] = []
+        dominant: Optional[Tuple[str, str]] = None
+        key_facts = data_card.get('key_facts') or []
+        for fact in key_facts:
+            if isinstance(fact, str) and fact.lower().startswith('latest tier mix:'):
+                mix_text = fact.split(':', 1)[1]
+                candidates = [seg.strip() for seg in mix_text.split(',') if seg.strip()]
+                for seg in candidates:
+                    match = re.match(r"([^\d]+)\s+([\d\.]+%?)", seg)
+                    if match:
+                        name = match.group(1).strip()
+                        value = match.group(2).strip()
+                        top_entries.append((name, value))
+            if isinstance(fact, str) and fact.lower().startswith('dominant tier:'):
+                body = fact.split(':', 1)[1]
+                match = re.match(r"\s*([^\(]+)\s*\(([^\)]+)\)", body)
+                if match:
+                    dominant = (match.group(1).strip(), match.group(2).strip())
+        return top_entries, dominant
+
+    def _parse_latest_delta() -> Tuple[Optional[float], Optional[str]]:
+        key_facts = data_card.get('key_facts') or []
+        pattern = re.compile(r"latest change:\s*([\+\-−]?[\d\.]+)")
+        for fact in key_facts:
+            if not isinstance(fact, str):
+                continue
+            match = pattern.search(fact.lower())
+            if match:
+                raw = match.group(1).replace('−', '-')
+                try:
+                    return float(raw), fact.split(':', 1)[1].strip()
+                except ValueError:
+                    return None, fact.split(':', 1)[1].strip()
+        return None, None
+
+    bullets: List[str] = []
+
+    if view_kind == 'composition':
+        top_entries, dominant = _parse_tier_mix()
+        lead = top_entries[0][0] if top_entries else (dominant[0] if dominant else "Top tier")
+        lag = top_entries[1][0] if len(top_entries) > 1 else "other tiers"
+        title = f"{lead} leads {metric_display} tiers while {lag} lags"
+        if 'tier' not in title.lower():
+            title = f"{lead} leads the {metric_display} tiers while {lag} lags"
+
+        for name, value in top_entries[:3]:
+            bullets.append(f"{name} holds {value} of the latest mix")
+        if dominant and dominant[0] not in [name for name, _ in top_entries[:3]]:
+            bullets.append(f"{dominant[0]} remains dominant at {dominant[1]}")
+        if latest_fmt is not None:
+            bullets.append(f"Overall level closed at {latest_fmt} across tiers")
+
+    elif view_kind == 'delta':
+        delta_value, delta_text = _parse_latest_delta()
+        move_word = 'rose' if delta_value is not None and delta_value > 0 else 'fell' if delta_value is not None and delta_value < 0 else 'held steady'
+        title = f"{metric_display} {move_word} {window_display}"
+        if delta_text:
+            bullets.append(f"Latest change {window_display}: {delta_text}")
+        elif delta_value is not None:
+            bullets.append(f"Latest change {window_display}: {delta_value:+.2f}")
+        if latest_fmt is not None and earliest_fmt is not None:
+            bullets.append(f"Level moved from {earliest_fmt} to {latest_fmt}")
+        elif latest_fmt is not None:
+            bullets.append(f"Current reading sits near {latest_fmt}")
+        if trend_text:
+            bullets.append(f"Underlying series shows {trend_text} shift")
+        bullets.append(f"Review highlights biggest {move_word} over the window")
+
+    else:
+        # Default to trend view behaviour
+        change_value = None
+        if isinstance(data_card.get('latest_value'), (int, float)) and isinstance(data_card.get('earliest_value'), (int, float)):
+            change_value = data_card['latest_value'] - data_card['earliest_value']
+        elif isinstance(data_card.get('trend_value'), (int, float, np.floating)):
+            change_value = data_card['trend_value']
+        motion = _movement_word(change_value)
+        title = f"{metric_display} {motion} through {period_range}"
+
+        if latest_fmt is not None and earliest_fmt is not None:
+            bullets.append(f"Started near {earliest_fmt} and ended around {latest_fmt}")
+        if trend_text:
+            bullets.append(f"Net change registered {trend_text}")
+        min_val = data_card.get('min_value')
+        max_val = data_card.get('max_value')
+        if min_val is not None and max_val is not None:
+            bullets.append(f"Range spanned from {fmt_value(min_val, metric_raw)} to {fmt_value(max_val, metric_raw)}")
+        else:
+            bullets.append(f"Trajectory covers {period_range} trend line")
+
+    if not bullets:
+        bullets = [f"{metric_display} view generated no additional facts"]
+
+    # Ensure bullet count within limits and remove trailing punctuation
+    cleaned: List[str] = []
+    for bullet in bullets:
+        text = str(bullet).strip()
+        if text.endswith('.'):
+            text = text[:-1]
+        if text:
+            cleaned.append(text)
+    bullets = cleaned[:max(NARRATIVE_LIMITS['bullet_max'], 1)]
+    while len(bullets) < max(NARRATIVE_LIMITS['bullet_min'], 1):
+        bullets.append(f"Additional context on {metric_display}")
+
+    strapline_base = {
+        'composition': f"{metric_display} tiers spotlight mix shifts",
+        'delta': f"{metric_display} {window_display if view_kind == 'delta' else ''} change in focus".strip(),
+        'trend': f"{metric_display} trend review",
+    }.get(view_kind, f"{metric_display} insight overview")
+
+    strapline = strapline_base[:NARRATIVE_LIMITS['strapline_max_chars']]
+
     return {
         'title': title[:NARRATIVE_LIMITS['title_max_chars']],
         'bullets': bullets,
-        'strapline': strapline[:NARRATIVE_LIMITS['strapline_max_chars']]
+        'strapline': strapline
     }
 
 
