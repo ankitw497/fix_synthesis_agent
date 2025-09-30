@@ -5,7 +5,7 @@ Implements CoverageLedger, product gating, and delta base availability checks.
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import pandas as pd
 import numpy as np
 
@@ -34,6 +34,22 @@ logger = setup_logging("validate_plan")
 
 # Constants for long-form tier detection
 LONG_FORM_TIER_CANDIDATES = ["score_curr_tier", "score_tier", "tier", "risk_tier", "score_band"]
+TIER_TOKEN_CANDIDATES = [
+    'super prime',
+    'superprime',
+    'prime+',
+    'prime plus',
+    'prime ',
+    ' prime',
+    'near-prime',
+    'near prime',
+    'subprime',
+    'sub-prime',
+]
+DELTA_TITLE_TOKENS = {
+    'yoy': ['yoy', 'year-over-year', 'year over year'],
+    'qoq': ['qoq', 'quarter-over-quarter', 'quarter over quarter'],
+}
 
 
 @dataclass
@@ -467,7 +483,8 @@ def apply_fallback_strategy(df: pd.DataFrame,
 
 
 def validate_plan_consistency(coverage_ledger: CoverageLedger,
-                             config: SynthesisConfig) -> Tuple[bool, List[str]]:
+                             config: SynthesisConfig,
+                             narratives: Optional[List[Dict[str, Any]]] = None) -> Tuple[bool, List[str]]:
     """
     Validate overall plan consistency.
     
@@ -499,5 +516,29 @@ def validate_plan_consistency(coverage_ledger: CoverageLedger,
             if df[chart_type].str.contains('✓').sum() == 0:
                 logger.warning(f"No {chart_type} charts in plan")
     
+    if narratives:
+        for narrative in narratives:
+            view = (narrative.get('view') or {}) if isinstance(narrative, dict) else {}
+            view_kind = (view.get('kind') or '').lower()
+            title = str(narrative.get('title', '') or '')
+            bullets = narrative.get('bullets') if isinstance(narrative.get('bullets'), list) else []
+            metric_name = narrative.get('metric', 'unknown metric')
+
+            if view_kind == 'composition':
+                combined = " ".join([title] + [str(b) for b in bullets]).lower()
+                normalized = combined.replace(';', ' ').replace('/', ' ').replace(',', ' ').replace('.', ' ')
+                if not any(token in normalized for token in TIER_TOKEN_CANDIDATES):
+                    logger.warning(
+                        f"Composition narrative for {metric_name} lacks tier references in title or bullets"
+                    )
+            elif view_kind == 'delta':
+                delta_type = (view.get('delta_type') or '').lower()
+                tokens = DELTA_TITLE_TOKENS.get(delta_type, [])
+                if tokens and not any(token in title.lower() for token in tokens):
+                    window_label = delta_type.upper()
+                    logger.warning(
+                        f"Delta narrative for {metric_name} missing {window_label} cue in title"
+                    )
+
     is_valid = len(issues) == 0
     return is_valid, issues

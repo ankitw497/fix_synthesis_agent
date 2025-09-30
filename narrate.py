@@ -32,7 +32,8 @@ def build_data_card(df: pd.DataFrame,
                    metric: str,
                    chart_type: str,
                    period_col: str = 'period',
-                   composition_base: Optional[str] = None) -> Dict[str, Any]:
+                   composition_base: Optional[str] = None,
+                   delta_type: Optional[str] = None) -> Dict[str, Any]:
     """
     Build data card with all facts for LLM.
     CRITICAL: Include composition_base for A3 charts.
@@ -60,6 +61,24 @@ def build_data_card(df: pd.DataFrame,
         'volatility': None,
         'composition_base': composition_base,  # CRITICAL for A3
         'key_facts': []
+    }
+
+    view_kind = 'trend'
+    split_dim = None
+    normalized_delta = (delta_type or '').lower() or None
+
+    if chart_type == 'A3':
+        view_kind = 'composition'
+        split_dim = composition_base or 'credit_tier'
+    elif chart_type == 'A4':
+        view_kind = 'delta'
+    elif chart_type not in {'A2', 'trend'}:
+        view_kind = chart_type.lower()
+
+    card['view'] = {
+        'kind': view_kind,
+        'split_dim': split_dim,
+        'delta_type': normalized_delta,
     }
     
     # Extract period range
@@ -126,7 +145,7 @@ def build_data_card(df: pd.DataFrame,
     # Add chart-specific facts
     if chart_type == 'A3' and composition_base:
         card['key_facts'].append(f"Composition based on {composition_base}")
-    
+
     if chart_type == 'A4':
         # Look for delta columns
         delta_cols = [c for c in df.columns if metric in c and any(d in c for d in ['_yoy_pct', '_qoq_pct', '_mom_pct'])]
@@ -147,11 +166,29 @@ def build_data_card(df: pd.DataFrame,
                 value = df.loc[latest_idx, tier] if latest_idx >= 0 else df[tier].iloc[-1]
                 if pd.notna(value):
                     tier_values[tier] = value
-        
+
         if tier_values:
+            def _format_tier_value(v: float) -> str:
+                if pd.isna(v):
+                    return "—"
+                if abs(v) <= 1.2:
+                    return fmt_percent(v, decimals=0)
+                return f"{float(v):.1f}"
+
+            def _clean_tier_name(name: str) -> str:
+                text = str(name or "").replace('_', ' ').strip()
+                return text.title() if text else "Tier"
+
+            if chart_type == 'A3':
+                ordered = sorted(tier_values.items(), key=lambda item: item[1], reverse=True)
+                top_pairs = ordered[:3]
+                mix_parts = [f"{_clean_tier_name(tier)} {_format_tier_value(val)}" for tier, val in top_pairs]
+                if mix_parts:
+                    card['key_facts'].append(f"Latest tier mix: {', '.join(mix_parts)}")
             # Find dominant tier
             dominant_tier = max(tier_values, key=tier_values.get)
-            card['key_facts'].append(f"Dominant tier: {dominant_tier} ({tier_values[dominant_tier]:.1f})")
+            dominant_value = _format_tier_value(tier_values[dominant_tier])
+            card['key_facts'].append(f"Dominant tier: {_clean_tier_name(dominant_tier)} ({dominant_value})")
     
     logger.info(f"Built data card for {metric}/{chart_type} with {len(card['key_facts'])} facts")
     return card
@@ -363,6 +400,26 @@ FORMAT:
   "strapline": "concise key insight under 140 chars"
 }}
 """
+
+    view = data_card.get('view', {}) or {}
+    view_kind = (view.get('kind') or '').lower()
+
+    if view_kind == 'trend':
+        prompt += "\nVIEW CONTEXT: This chart shows an over-time trend.\nWrite a natural, one-sentence title summarizing how the metric moved across the shown period range.\nFavor verbs like “softened”, “stabilized”, “accelerated”, “rebounded”. Avoid fragments."
+    elif view_kind == 'composition':
+        prompt += "\nVIEW CONTEXT: This chart shows the metric split by credit tiers (composition).\nTitle MUST naturally mention tiers and who leads or lags (e.g., “Prime+ leads; Subprime eases”).\nIn bullets, call out the top 2–3 tiers and whether each rose, fell, or held steady versus the comparison point.\nUse concise tier names (Super Prime, Prime+, Prime, Near-Prime, Subprime) if present."
+    elif view_kind == 'delta':
+        delta_window = (view.get('delta_type') or '').lower()
+        window_display = {
+            'qoq': 'QoQ',
+            'yoy': 'YoY',
+            'mom': 'MoM',
+        }.get(delta_window, delta_window.upper() if delta_window else 'QoQ')
+        prompt += (
+            f"\nVIEW CONTEXT: This chart shows change versus a comparison period. The window is: {window_display}."
+            "\nTitle MUST naturally state the window (e.g., “Balances rose YoY, led by Prime+”)."
+            "\nIn bullets, highlight the largest increase and largest decrease (if any) and whether the move is meaningful."
+        )
 
     if data_card.get('composition_base'):
         prompt += (

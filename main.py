@@ -173,6 +173,55 @@ def _focus_suffix_from_period(period: Optional[str]) -> Optional[str]:
     return None
 
 
+def nudge_title_for_view(title: str, view: Optional[Dict[str, Any]], attempt: int = 1) -> str:
+    """Add a light-weight suffix to differentiate titles across views."""
+
+    if not title:
+        return title
+
+    base = str(title).strip()
+    trailing = ''
+    if base and base[-1] in '.!?':
+        trailing = base[-1]
+        base = base[:-1].rstrip()
+
+    view = view or {}
+    kind = (view.get('kind') or '').lower()
+    delta_type = (view.get('delta_type') or '').lower()
+
+    suffix_map = {
+        'composition': 'with tier shifts in focus',
+        'delta': {
+            'yoy': 'on a YoY basis',
+            'qoq': 'on a QoQ basis',
+            'mom': 'on a MoM basis',
+        }.get(delta_type, 'on a delta basis'),
+        'trend': 'tracking the overall trend',
+    }
+    suffix = suffix_map.get(kind, 'with this view in focus')
+
+    if suffix and suffix.lower() in base.lower():
+        alt_suffix_map = {
+            'composition': 'adding extra tier detail',
+            'delta': {
+                'yoy': 'reinforcing YoY shifts',
+                'qoq': 'reinforcing QoQ shifts',
+                'mom': 'reinforcing MoM shifts',
+            }.get(delta_type, 'highlighting delta nuances'),
+            'trend': 'with the timeline perspective',
+        }
+        suffix = alt_suffix_map.get(kind, f"from the {kind or 'alternate'} view")
+
+    if attempt > 1:
+        suffix = f"{suffix} ({attempt})"
+
+    candidate = f"{base}, {suffix}" if suffix else base
+    if trailing:
+        candidate = f"{candidate}{trailing}"
+
+    return candidate
+
+
 @dataclass
 class PipelineContext:
     """
@@ -194,7 +243,8 @@ class PipelineContext:
     slide_cache_keys: Set[str] = field(default_factory=set)
     slide_content_hashes: Set[str] = field(default_factory=set)
     sections_added: Set[str] = field(default_factory=set)
-    
+    metric_view_titles: Dict[str, List[str]] = field(default_factory=dict)
+
     def add_figure(self, fig_data: Dict[str, Any], chart_type: str):
         """Add a figure artifact with metadata."""
         self.figures.append(fig_data)
@@ -211,6 +261,29 @@ class PipelineContext:
     def add_narrative(self, narrative_data: Dict[str, Any]):
         """Add a narrative artifact."""
         self.narratives.append(narrative_data)
+
+    def register_view_title(self, metric: str, base_title: str, view: Optional[Dict[str, Any]]) -> str:
+        """Ensure titles per metric remain unique across views."""
+
+        if not base_title:
+            return base_title
+
+        history = self.metric_view_titles.setdefault(metric, [])
+        candidate = base_title
+        attempt = 0
+
+        while candidate in history and attempt < 5:
+            attempt += 1
+            candidate = nudge_title_for_view(base_title, view, attempt=attempt)
+
+        if candidate in history:
+            view_label = (view or {}).get('kind') or 'view'
+            candidate = f"{base_title} ({view_label})"
+            if candidate in history:
+                candidate = f"{base_title} ({view_label} {len(history) + 1})"
+
+        history.append(candidate)
+        return candidate
 
 
 def _delinquency_headline(
@@ -1157,11 +1230,30 @@ def process_topic(topic: str,
                 if chart_type == 'A3':
                     composition_base = select_composition_base(src_df, metric)
                 
-                data_card = build_data_card(src_df, metric, chart_type, composition_base=composition_base)
-                
+                delta_for_card = None
+                if chart_type == 'A4':
+                    if family_resolution and family_resolution.get('short_delta'):
+                        delta_for_card = family_resolution.get('short_delta')
+                    else:
+                        delta_for_card = 'yoy'
+                data_card = build_data_card(
+                    src_df,
+                    metric,
+                    chart_type,
+                    composition_base=composition_base,
+                    delta_type=delta_for_card,
+                )
+
                 # Generate narrative
                 narrative = llm_narrate(data_card, config)
                 results['narratives_generated'] += 1
+
+                view_context = data_card.get('view')
+                narrative_title = (narrative.get('title') or '').strip()
+                if narrative_title:
+                    adjusted_title = ctx.register_view_title(metric, narrative_title, view_context)
+                    if adjusted_title != narrative_title:
+                        narrative['title'] = adjusted_title
                 
                 # QC check for avg_acct_per_cnsmr contradictions
                 if 'avg_acct_per_cnsmr' in metric.lower():
@@ -1260,6 +1352,8 @@ def process_topic(topic: str,
                 # Track narrative artifact
                 ctx.add_narrative({
                     'metric': metric,
+                    'chart_type': chart_type,
+                    'view': data_card.get('view'),
                     'title': narrative.get('title', ''),
                     'bullets': narrative.get('bullets', []),
                     'strapline': narrative.get('strapline', '')
@@ -1411,6 +1505,13 @@ def process_topic(topic: str,
                                 trend_chart_title = f"{base_phrase} Trend"
                                 trend_card = build_data_card(prepared_trend, avail[0], 'A2')
                                 trend_narrative = llm_narrate(trend_card, config)
+                                trend_title = (trend_narrative.get('title') or '').strip()
+                                if trend_title:
+                                    adjusted = ctx.register_view_title(
+                                        avail[0], trend_title, trend_card.get('view')
+                                    )
+                                    if adjusted != trend_title:
+                                        trend_narrative['title'] = adjusted
                                 add_chart_slide(
                                     presentation,
                                     delinquency_headline,
@@ -1430,6 +1531,8 @@ def process_topic(topic: str,
                                 })
                                 ctx.add_narrative({
                                     'metric': avail[0],
+                                    'chart_type': 'A2',
+                                    'view': trend_card.get('view'),
                                     'title': trend_narrative.get('title', ''),
                                     'bullets': trend_narrative.get('bullets', []),
                                     'strapline': trend_narrative.get('strapline', ''),
@@ -1465,6 +1568,13 @@ def process_topic(topic: str,
                                     composition_base='credit_tier',
                                 )
                                 severity_narrative = llm_narrate(severity_card, config)
+                                severity_title = (severity_narrative.get('title') or '').strip()
+                                if severity_title:
+                                    adjusted = ctx.register_view_title(
+                                        avail[0], severity_title, severity_card.get('view')
+                                    )
+                                    if adjusted != severity_title:
+                                        severity_narrative['title'] = adjusted
                                 add_chart_slide(
                                     presentation,
                                     split_title,
@@ -1484,6 +1594,8 @@ def process_topic(topic: str,
                                 })
                                 ctx.add_narrative({
                                     'metric': avail[0],
+                                    'chart_type': 'A3',
+                                    'view': severity_card.get('view'),
                                     'title': severity_narrative.get('title', ''),
                                     'bullets': severity_narrative.get('bullets', []),
                                     'strapline': severity_narrative.get('strapline', ''),
@@ -1786,8 +1898,28 @@ def process_topic(topic: str,
                         }
                         ctx.add_figure(figure_data, yoy_chart_type)
 
-                        data_card2 = build_data_card(src_df, metric, yoy_chart_type)
+                        data_card2 = build_data_card(
+                            src_df,
+                            metric,
+                            yoy_chart_type,
+                            delta_type=delta_type,
+                        )
                         narrative2 = llm_narrate(data_card2, config)
+                        view_context2 = data_card2.get('view')
+                        title2 = (narrative2.get('title') or '').strip()
+                        if title2:
+                            adjusted2 = ctx.register_view_title(metric, title2, view_context2)
+                            if adjusted2 != title2:
+                                narrative2['title'] = adjusted2
+
+                        ctx.add_narrative({
+                            'metric': metric,
+                            'chart_type': yoy_chart_type,
+                            'view': view_context2,
+                            'title': narrative2.get('title', ''),
+                            'bullets': narrative2.get('bullets', []),
+                            'strapline': narrative2.get('strapline', ''),
+                        })
 
                         # Compute headline for YoY
                         from synthesis_agent.utils import pretty_label, fmt_value
@@ -1917,11 +2049,18 @@ def process_topic(topic: str,
                 try:
                     # Create minimal data card
                     data_card = build_data_card(src_df, metric, 'A2')
-                    
+
                     # Generate narrative anyway
                     narrative = llm_narrate(data_card, config)
                     results['narratives_generated'] += 1
-                    
+
+                    fallback_view = data_card.get('view')
+                    fallback_title = (narrative.get('title') or '').strip()
+                    if fallback_title:
+                        adjusted = ctx.register_view_title(metric, fallback_title, fallback_view)
+                        if adjusted != fallback_title:
+                            narrative['title'] = adjusted
+
                     # Add slide without image (with deduplication check)
                     if presentation and not ctx.dry_run:
                         # Check for duplicate content
@@ -1975,6 +2114,15 @@ def process_topic(topic: str,
                             logger.info(f"Skipping duplicate narrative-only slide for {metric}")
                         logger.info(f"Added narrative-only slide for {metric} after chart failure")
                         results['slides_created'] += 1
+
+                    ctx.add_narrative({
+                        'metric': metric,
+                        'chart_type': 'A2',
+                        'view': fallback_view,
+                        'title': narrative.get('title', ''),
+                        'bullets': narrative.get('bullets', []),
+                        'strapline': narrative.get('strapline', ''),
+                    })
                 except Exception as narr_e:
                     logger.error(f"Also failed to generate narrative for {metric}: {narr_e}")
         
@@ -2449,7 +2597,7 @@ def main():
     coverage_ledger.print_summary()
     
     # Validate plan consistency
-    is_valid, issues = validate_plan_consistency(coverage_ledger, config)
+    is_valid, issues = validate_plan_consistency(coverage_ledger, config, ctx.narratives)
     if not is_valid:
         logger.warning(f"Plan validation issues: {issues}")
     
