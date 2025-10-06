@@ -470,3 +470,40 @@ DELTA_CLUSTERS = {
     "Supply averages": ["avg_cr_lines", "avg_open_to_buy", "avg_open_to_buy_per_cnsmr"],
     "Average set": ["avg_acct_bal", "avg_tot_bal_per_cnsmr", "avg_acct_per_cnsmr"]
 }
+
+# --- Added: tier-aware split detection for narratives ---
+TIER_LABELS = {"SUBPRIME","NEAR_PRIME","PRIME","PRIME_PLUS","SUPER_PRIME","UNSCORED","OTHER","TOTAL"}
+
+def infer_split_dimension(chart_meta: dict = None, df=None) -> str:
+    """
+    Infer the split dimension for a chart to guide tier-aware narratives.
+    Returns one of: 'credit_tier', 'score_bin', 'none'.
+
+    Priority:
+    1) chart_meta['split_dim'] if present and recognized
+    2) Legend/series labels in chart_meta (looks like tier names)
+    3) DataFrame column names: credit_tier/score_bin/tier/score_bins
+    """
+    chart_meta = chart_meta or {}
+
+    split_dim = chart_meta.get("split_dim")
+    if split_dim in {"credit_tier", "score_bin"}:
+        return split_dim
+
+    # Check series labels from metadata
+    labels = set([str(s).upper() for s in chart_meta.get("series_labels", [])])
+    if labels & TIER_LABELS and len(labels & TIER_LABELS) >= 2:
+        return "credit_tier"
+
+    # Check dataframe columns
+    if df is not None:
+        try:
+            cols = {c.lower() for c in getattr(df, "columns", [])}
+            if {"score_bin", "score_bins", "tier", "credit_tier"} & cols:
+                if "score_bin" in cols or "score_bins" in cols:
+                    return "score_bin"
+                return "credit_tier"
+        except Exception:
+            pass
+
+    return "none"
